@@ -30,6 +30,7 @@ import (
 	"github.com/tochemey/goakt/v4/internal/metric"
 	"github.com/tochemey/goakt/v4/internal/xsync"
 	"github.com/tochemey/goakt/v4/log"
+	"github.com/tochemey/goakt/v4/placement"
 	"github.com/tochemey/goakt/v4/remote"
 	"github.com/tochemey/goakt/v4/supervisor"
 	"github.com/tochemey/goakt/v4/tls"
@@ -251,6 +252,40 @@ func WithMessageRetention(retention time.Duration) Option {
 func WithoutRelocation() Option {
 	return OptionFunc(func(system *actorSystem) {
 		system.relocationEnabled.Store(false)
+	})
+}
+
+// WithPlacementJournal configures the ActorSystem to record relocatable
+// actor and grain placements in journal, so the cluster leader can respawn
+// them elsewhere after a node dies without a graceful shutdown (kill -9,
+// OOM, hardware loss).
+//
+// Without this option (the default), relocation only happens when a node
+// shuts down gracefully: preShutdown snapshots the node's relocatable
+// actors and grains and replicates that snapshot to peers before the node
+// leaves membership. A crash never runs preShutdown, so nothing is
+// replicated and the departed node's actors and grains are lost until an
+// external caller happens to re-activate them.
+//
+// With a journal configured, every relocatable actor spawn and every grain
+// activation is additionally recorded via journal.Record, and removed via
+// journal.Delete once the actor or grain stops deliberately. When the
+// cluster leader handles a NodeLeft event for a node it has no graceful
+// state for, it replays that node's remaining journal entries through the
+// same relocation machinery used for graceful departures.
+//
+// journal must be safe for concurrent use. GoAkt ships
+// placement.NewInMemoryJournal for tests and single-process clusters;
+// production deployments that need crash relocation across separate node
+// processes must supply a journal backed by storage every node can reach
+// (a database, Redis, etc.).
+//
+// Passing a nil journal makes no change and crash relocation stays off.
+func WithPlacementJournal(journal placement.Journal) Option {
+	return OptionFunc(func(system *actorSystem) {
+		if journal != nil {
+			system.placementJournal = journal
+		}
 	})
 }
 

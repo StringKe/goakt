@@ -6,7 +6,9 @@ sidebarTitle: "Relocation"
 
 **Relocation** is the automatic migration of actors and grains from a node that has left the cluster to the remaining live nodes. When a node shuts down **gracefully**, its relocatable actors and grains are recreated on other nodes so the cluster remains available.
 
-> **Note:** Relocation requires a graceful shutdown. If a node crashes (kill -9, OOM, etc.), `preShutdown` and `persistPeerStateToPeers` never run, so peer state is not replicated and relocation does not occur. Actors and grains on a crashed node are lost.
+<Note>
+Relocation as described on this page requires a graceful shutdown. If a node crashes (kill -9, OOM, etc.), `preShutdown` and `persistPeerStateToPeers` never run, so no peer state is replicated and relocation does not occur by default. See [Crash Relocation](/actor/crash-relocation) for the opt-in placement journal that closes this gap.
+</Note>
 
 ## When relocation happens
 
@@ -125,6 +127,7 @@ See [Extensions and Dependencies](/advanced/extensions-and-dependencies) for dep
 
 ## See also
 
+- [Crash Relocation](/actor/crash-relocation) — Opt-in placement journal for node crashes (kill -9, OOM)
 - [Clustered Mode](/clustering/clustered) — Cluster setup and discovery
 - [Singletons](/actor/singletons) — Cluster singletons and placement
 - [Grains](/grains/overview) — Virtual actors and `WithGrainDisableRelocation`
