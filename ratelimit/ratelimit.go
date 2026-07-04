@@ -145,10 +145,19 @@ func (l *Limiter) AllowN(ctx context.Context, key string, n int) (bool, error) {
 
 	windowKey := l.windowKey(key)
 
+	// A rejected request must not consume any budget: seeding the fresh window
+	// with n on rejection would poison the whole window and starve later,
+	// smaller requests until it expires.
+	admit := n <= l.limit
+	seed := 0
+	if admit {
+		seed = n
+	}
+
 	// Fast path: this call is the first to touch the window, so PutIfAbsent both
 	// creates the counter and settles the admission decision in one round-trip.
-	if err := l.store.PutIfAbsent(ctx, windowKey, encodeCount(n), kv.WithTTL(l.window)); err == nil {
-		return n <= l.limit, nil
+	if err := l.store.PutIfAbsent(ctx, windowKey, encodeCount(seed), kv.WithTTL(l.window)); err == nil {
+		return admit, nil
 	} else if !errors.Is(err, kv.ErrKeyExists) {
 		return false, err
 	}
@@ -168,10 +177,10 @@ func (l *Limiter) AllowN(ctx context.Context, key string, n int) (bool, error) {
 		}
 		// The counter expired between the PutIfAbsent race above and acquiring the
 		// lock: this call now starts a fresh window.
-		if err := l.store.Put(ctx, windowKey, encodeCount(n), kv.WithTTL(l.window)); err != nil {
+		if err := l.store.Put(ctx, windowKey, encodeCount(seed), kv.WithTTL(l.window)); err != nil {
 			return false, err
 		}
-		return n <= l.limit, nil
+		return admit, nil
 	}
 
 	current, err := decodeCount(raw)
