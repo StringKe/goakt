@@ -52,6 +52,11 @@ type fakeStore struct {
 	// denyLock, when true, makes TryLock always report ErrLockNotAcquired, to
 	// exercise the ErrLimiterBusy retry-budget path.
 	denyLock bool
+
+	// dropOnNextGet, when set, makes the next Get for that key delete the entry
+	// and report ErrKeyNotFound, simulating a window that expires between the
+	// PutIfAbsent race and the post-lock read.
+	dropOnNextGet string
 }
 
 type fakeEntry struct {
@@ -71,6 +76,11 @@ func (s *fakeStore) Get(_ context.Context, key string) ([]byte, error) {
 	defer s.mu.Unlock()
 	if s.forcedErr != nil {
 		return nil, s.forcedErr
+	}
+	if s.dropOnNextGet == key {
+		s.dropOnNextGet = ""
+		delete(s.values, key)
+		return nil, kv.ErrKeyNotFound
 	}
 	entry, ok := s.values[key]
 	if !ok || (!entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt)) {
@@ -271,6 +281,51 @@ func TestAllowN(t *testing.T) {
 		ok, err = limiter.AllowN(ctx, "user-1", 2)
 		require.NoError(t, err)
 		require.True(t, ok, "the remaining 2 units of budget must still be available")
+	})
+
+	t.Run("an over-limit burst as the window's first call must not poison the window", func(t *testing.T) {
+		store := newFakeStore()
+		limiter, err := New(store, 3, time.Minute)
+		require.NoError(t, err)
+
+		// fast path: first touch of the window is already over the limit
+		ok, err := limiter.AllowN(ctx, "user-1", 10)
+		require.NoError(t, err)
+		require.False(t, ok)
+
+		// the rejected burst must not have seeded the counter with 10:
+		// the full budget must remain available within the same window
+		for i := 0; i < 3; i++ {
+			ok, err = limiter.Allow(ctx, "user-1")
+			require.NoError(t, err)
+			require.True(t, ok, "request %d must still fit the untouched budget", i+1)
+		}
+
+		ok, err = limiter.Allow(ctx, "user-1")
+		require.NoError(t, err)
+		require.False(t, ok, "budget of 3 is now genuinely spent")
+	})
+
+	t.Run("an over-limit burst rebuilding an expired window must not poison it", func(t *testing.T) {
+		store := newFakeStore()
+		limiter, err := New(store, 3, time.Minute)
+		require.NoError(t, err)
+
+		// force the slow path: the counter key exists at PutIfAbsent time but is
+		// gone by the post-lock Get, i.e. the window expired in between
+		windowKey := limiter.windowKey("user-1")
+		require.NoError(t, store.Put(ctx, windowKey, encodeCount(1)))
+		store.dropOnNextGet = windowKey
+
+		ok, err := limiter.AllowN(ctx, "user-1", 10)
+		require.NoError(t, err)
+		require.False(t, ok)
+
+		for i := 0; i < 3; i++ {
+			ok, err = limiter.Allow(ctx, "user-1")
+			require.NoError(t, err)
+			require.True(t, ok, "request %d must still fit the untouched budget", i+1)
+		}
 	})
 }
 
