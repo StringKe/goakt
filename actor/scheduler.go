@@ -57,6 +57,8 @@ type scheduler struct {
 	shutdownTimeout time.Duration
 	// specifies the job keys mapping
 	scheduledKeys *xsync.Map[string, *quartz.JobKey]
+	// specifies the introspection metadata mapping used by ListSchedules
+	scheduledMeta *xsync.Map[string, *scheduleMeta]
 	// actorSystem is needed to resolve NoSender() for remote-PID schedules,
 	// since remote PIDs carry no actor-system reference.
 	actorSystem ActorSystem
@@ -100,6 +102,7 @@ func newScheduler(logger log.Logger, shutdownTimeout time.Duration, system Actor
 		logger:          logger,
 		shutdownTimeout: shutdownTimeout,
 		scheduledKeys:   xsync.NewMap[string, *quartz.JobKey](),
+		scheduledMeta:   xsync.NewMap[string, *scheduleMeta](),
 		actorSystem:     system,
 		persistent:      persistent,
 	}
@@ -173,6 +176,7 @@ func (x *scheduler) Stop(ctx context.Context) {
 	x.quartzScheduler.Wait(ctx)
 
 	x.scheduledKeys.Reset()
+	x.scheduledMeta.Reset()
 	x.logger.Info("messages scheduler stopped...:)")
 }
 
@@ -208,6 +212,7 @@ func (x *scheduler) ScheduleOnce(message any, to *PID, delay time.Duration, opts
 	senderConfig := newScheduleConfig(opts...)
 	reference := senderConfig.Reference()
 	jobKey := quartz.NewJobKey(reference)
+	x.recordSchedule(reference, &scheduleMeta{kind: TriggerKindOnce, interval: delay, address: to.Path().String()})
 
 	triggerSpec := &internalpb.ScheduleTrigger{
 		Kind: &internalpb.ScheduleTrigger_Once{Once: &internalpb.OnceTrigger{Delay: durationpb.New(delay)}},
@@ -254,6 +259,7 @@ func (x *scheduler) Schedule(message any, to *PID, interval time.Duration, opts 
 	senderConfig := newScheduleConfig(opts...)
 	reference := senderConfig.Reference()
 	jobKey := quartz.NewJobKey(reference)
+	x.recordSchedule(reference, &scheduleMeta{kind: TriggerKindInterval, interval: interval, address: to.Path().String()})
 
 	triggerSpec := &internalpb.ScheduleTrigger{
 		Kind: &internalpb.ScheduleTrigger_Interval{Interval: &internalpb.IntervalTrigger{Interval: durationpb.New(interval)}},
@@ -307,6 +313,7 @@ func (x *scheduler) ScheduleWithCron(message any, to *PID, cronExpression string
 		x.logger.Error(fmt.Errorf("failed to schedule message: %w", err))
 		return err
 	}
+	x.recordSchedule(reference, &scheduleMeta{kind: TriggerKindCron, expression: cronExpression, address: to.Path().String()})
 
 	triggerSpec := &internalpb.ScheduleTrigger{
 		Kind: &internalpb.ScheduleTrigger_Cron{Cron: &internalpb.CronTrigger{Expression: cronExpression, Timezone: location.String()}},
@@ -335,6 +342,7 @@ func (x *scheduler) CancelSchedule(reference string) error {
 	defer x.mu.Unlock()
 
 	defer x.scheduledKeys.Delete(reference)
+	defer x.scheduledMeta.Delete(reference)
 
 	if !x.started.Load() {
 		return errors.ErrSchedulerNotStarted
