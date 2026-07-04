@@ -125,6 +125,11 @@ func (x *deathWatch) handleTerminated(ctx *ReceiveContext) error {
 				}
 				return errors.NewInternalError(err)
 			}
+
+			// the actor deliberately stopped rather than crashing with the
+			// node, so its placement journal entry (if any) no longer
+			// describes where it lives and must be dropped.
+			actorSys.deleteActorPlacement(ctx, pid.ID())
 		}
 
 		if logger.Enabled(log.DebugLevel) {

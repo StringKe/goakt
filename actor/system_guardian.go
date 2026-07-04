@@ -124,6 +124,18 @@ func (x *systemGuardian) completeRebalancing(msg *internalpb.RebalanceComplete) 
 	if x.logger.Enabled(log.DebugLevel) {
 		x.logger.Debugf("left node=%s removed from cache", msg.GetPeerAddress())
 	}
+
+	// the departed node's placements have now been replayed (or were never
+	// journaled, in which case this is a no-op); drop its journal entries so
+	// a placement journal does not keep growing across crashes.
+	if journal := x.pid.ActorSystem().getPlacementJournal(); journal != nil {
+		if err := journal.DeleteByNode(ctx, msg.GetPeerAddress()); err != nil {
+			if x.logger.Enabled(log.ErrorLevel) {
+				x.logger.Errorf("failed to remove left node=%s from placement journal: %v (hint: check placement journal store)", msg.GetPeerAddress(), err)
+			}
+		}
+	}
+
 	if x.logger.Enabled(log.InfoLevel) {
 		x.logger.Info("rebalancing completed successfully")
 	}

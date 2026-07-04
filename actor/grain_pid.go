@@ -261,6 +261,11 @@ func (pid *grainPID) deactivate(ctx context.Context) (err error) {
 			}
 			return gerrors.NewErrGrainDeactivationFailure(err)
 		}
+
+		// the grain deliberately deactivated rather than crashing with the
+		// node, so its placement journal entry (if any) no longer describes
+		// where it lives and must be dropped.
+		actorSystem.deleteGrainPlacement(ctx, identity.String())
 	}
 
 	if pid.logger.Enabled(log.DebugLevel) {

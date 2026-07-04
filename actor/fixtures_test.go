@@ -68,6 +68,7 @@ import (
 	mockcluster "github.com/tochemey/goakt/v4/mocks/cluster"
 	mocksremote "github.com/tochemey/goakt/v4/mocks/remoteclient"
 	"github.com/tochemey/goakt/v4/passivation"
+	"github.com/tochemey/goakt/v4/placement"
 	"github.com/tochemey/goakt/v4/remote"
 	"github.com/tochemey/goakt/v4/test/data/testpb"
 	"github.com/tochemey/goakt/v4/tls"
@@ -2007,6 +2008,7 @@ type testClusterConfig struct {
 	roles             []string
 	contextPropagator remote.ContextPropagator
 	extraGrains       []Grain
+	placementJournal  placement.Journal
 }
 
 type testClusterOption func(*testClusterConfig)
@@ -2040,6 +2042,12 @@ func withTestContextPropagator(propagator remote.ContextPropagator) testClusterO
 func withTestExtraGrains(grains ...Grain) testClusterOption {
 	return func(tc *testClusterConfig) {
 		tc.extraGrains = append(tc.extraGrains, grains...)
+	}
+}
+
+func withTestPlacementJournal(journal placement.Journal) testClusterOption {
+	return func(tc *testClusterConfig) {
+		tc.placementJournal = journal
 	}
 }
 
@@ -2200,6 +2208,10 @@ func testSystem(t *testing.T, providerFactory providerFactory, opts ...testClust
 
 	if cfg.extension != nil {
 		options = append(options, WithExtensions(cfg.extension))
+	}
+
+	if cfg.placementJournal != nil {
+		options = append(options, WithPlacementJournal(cfg.placementJournal))
 	}
 
 	remoteOpts := []remote.Option{remote.WithCompression(cfg.compression)}

@@ -1,0 +1,71 @@
+---
+title: Crash Relocation
+description: Opt-in placement journal that relocates actors and grains after a node crash.
+sidebarTitle: "Crash Relocation"
+---
+
+[Relocation](/actor/relocation) migrates actors and grains from a node that **shuts down gracefully**. A node that crashes — `kill -9`, an OOM kill, hardware loss — never runs `preShutdown`, so no peer state is ever replicated to the rest of the cluster, and its relocatable actors and grains are simply gone until an external caller happens to re-activate them.
+
+The **placement journal** closes that gap. It is opt-in and off by default: without it, GoAkt's behavior after a crash is unchanged from today.
+
+<Note>
+Crash relocation only helps actors and grains that opted into relocation in the first place (the default). Actors spawned with `WithRelocationDisabled` and grains spawned with `WithGrainDisableRelocation` are never journaled or replayed, on a crash or otherwise.
+</Note>
+
+## How it works
+
+1. **Recording** — Every time a relocatable actor is spawned, or a relocatable grain is activated, GoAkt writes a placement entry describing it (address, kind, dependencies, supervisor, etc.) to the configured journal. The entry is removed when the actor or grain stops deliberately (passivation, `Kill`, `Shutdown`).
+2. **Detecting** — The cluster membership layer detects a node's departure and emits a `NodeLeft` event, exactly as it does for a graceful shutdown.
+3. **Replaying** — The cluster leader first looks for graceful peer state (pushed by `persistPeerStateToPeers`), as it always has. If none exists — the signature of a crash — and a placement journal is configured, the leader replays that node's remaining journal entries instead, reconstructing the same peer-state snapshot a graceful shutdown would have produced.
+4. **Relocating** — From there, the existing relocation machinery takes over unchanged: singletons go to the leader, other actors and grains are distributed across the leader and peers. See [Relocation](/actor/relocation) for that flow.
+5. **Cleanup** — Once the leader's relocator finishes (successfully or not), the departed node's journal entries are cleared so the journal does not grow across repeated crashes.
+
+## Enabling it
+
+Configure a `placement.Journal` implementation with `WithPlacementJournal`:
+
+```go
+import (
+    "github.com/tochemey/goakt/v4/actor"
+    "github.com/tochemey/goakt/v4/placement"
+)
+
+journal := placement.NewInMemoryJournal()
+
+system, err := actor.NewActorSystem("app",
+    actor.WithCluster(clusterConfig),
+    actor.WithPlacementJournal(journal),
+)
+```
+
+Passing `nil`, or not calling `WithPlacementJournal` at all, leaves crash relocation off: the actor system behaves exactly as it does today.
+
+## The `Journal` interface
+
+```go
+package placement
+
+type Journal interface {
+    Record(ctx context.Context, entry *Entry) error
+    Delete(ctx context.Context, node, id string) error
+    ListByNode(ctx context.Context, node string) ([]*Entry, error)
+    DeleteByNode(ctx context.Context, node string) error
+}
+```
+
+`Entry.Payload` is an opaque, serialized snapshot of the placement (an actor or a grain record); implementations store and return it unmodified.
+
+<Warning>
+`placement.NewInMemoryJournal()` is process-local: it does not survive the process it runs in, so on its own it cannot provide crash relocation **across separate node processes** — it is meant for tests and single-process clusters. Production deployments that need crash relocation across a real, multi-process cluster must supply a `Journal` backed by storage every node can reach (a database, Redis, etc.), following the same bring-your-own-adapter pattern as `discovery.Provider`. GoAkt keeps that adapter outside core.
+</Warning>
+
+## Testing with a hard-killed node
+
+Because the standard test harnesses stop nodes gracefully, exercising the crash path in a test means synthesizing what a real crash would have left behind: journal entries for a node that never actually ran, then driving the `NodeLeft` handling directly. That is what GoAkt's own test suite does for this feature — see `TestCrashRelocationReplaysJournalForDeadNode` in the `actor` package for the pattern.
+
+## See also
+
+- [Relocation](/actor/relocation) — Graceful-shutdown relocation flow and actor allocation
+- [Singletons](/actor/singletons) — Cluster singletons and placement
+- [Grains](/grains/overview) — Virtual actors and `WithGrainDisableRelocation`
+- [Coordinated Shutdown](/advanced/coordinated-shutdown) — Shutdown sequence and `preShutdown`

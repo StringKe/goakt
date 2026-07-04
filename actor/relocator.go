@@ -142,8 +142,16 @@ func (r *relocator) abortRelocation(ctx *ReceiveContext, address string, actors 
 	r.pid.ActorSystem().completeRelocation()
 	r.publishRelocationFailed(address, actors, grains, err)
 
-	if derr := r.pid.ActorSystem().getClusterStore().DeletePeerState(context.WithoutCancel(ctx.Context()), address); derr != nil {
+	rctx := context.WithoutCancel(ctx.Context())
+
+	if derr := r.pid.ActorSystem().getClusterStore().DeletePeerState(rctx, address); derr != nil {
 		r.pid.getLogger().Errorf("failed to remove peer=%s state after failed relocation: %v (hint: check cluster store)", address, derr)
+	}
+
+	if journal := r.pid.ActorSystem().getPlacementJournal(); journal != nil {
+		if derr := journal.DeleteByNode(rctx, address); derr != nil {
+			r.pid.getLogger().Errorf("failed to remove peer=%s entries from placement journal after failed relocation: %v (hint: check placement journal store)", address, derr)
+		}
 	}
 
 	ctx.Err(err)

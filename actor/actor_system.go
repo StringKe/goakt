@@ -74,6 +74,7 @@ import (
 	"github.com/tochemey/goakt/v4/log"
 	"github.com/tochemey/goakt/v4/memory"
 	"github.com/tochemey/goakt/v4/passivation"
+	"github.com/tochemey/goakt/v4/placement"
 	"github.com/tochemey/goakt/v4/remote"
 	sup "github.com/tochemey/goakt/v4/supervisor"
 	gtls "github.com/tochemey/goakt/v4/tls"
@@ -881,6 +882,9 @@ type ActorSystem interface {
 	passivationManager() *passivationManager
 	getDispatcher() *dispatcher
 	getClusterStore() cluster.Store
+	getPlacementJournal() placement.Journal
+	deleteActorPlacement(ctx context.Context, actorID string)
+	deleteGrainPlacement(ctx context.Context, grainID string)
 	getDataCenterController() *datacentercontroller.Controller
 	getDataCenterConfig() *datacenter.Config
 }
@@ -1047,6 +1051,13 @@ type actorSystem struct {
 	metricProvider *metric.Provider
 
 	clusterStore cluster.Store
+
+	// placementJournal records relocatable actor/grain placements so the
+	// cluster leader can respawn them after a node dies without a graceful
+	// shutdown. Nil (the default) leaves crash relocation off: only the
+	// existing preShutdown/persistPeerStateToPeers path applies. Set via
+	// WithPlacementJournal.
+	placementJournal placement.Journal
 
 	dataCenterController        *datacentercontroller.Controller
 	dataCenterControllerMutex   sync.Mutex
@@ -2428,6 +2439,41 @@ func (x *actorSystem) getClusterStore() cluster.Store {
 	return store
 }
 
+// getPlacementJournal returns the configured placement journal, or nil when
+// WithPlacementJournal was not used (crash relocation stays off).
+func (x *actorSystem) getPlacementJournal() placement.Journal {
+	x.locker.RLock()
+	journal := x.placementJournal
+	x.locker.RUnlock()
+	return journal
+}
+
+// deleteActorPlacement removes actorID's entry from the placement journal, a
+// no-op when no journal is configured. Called when an actor stops
+// deliberately (passivation, Kill, supervised removal) so the journal only
+// ever holds entries for actors still actually hosted on this node.
+func (x *actorSystem) deleteActorPlacement(ctx context.Context, actorID string) {
+	journal := x.getPlacementJournal()
+	if journal == nil {
+		return
+	}
+	if err := journal.Delete(ctx, x.PeersAddress(), actorID); err != nil {
+		x.logger.Errorf("node=%s failed to delete placement journal entry for actor=%s: %v (hint: check placement journal store)", x.PeersAddress(), actorID, err)
+	}
+}
+
+// deleteGrainPlacement removes grainID's entry from the placement journal.
+// See deleteActorPlacement for the rationale.
+func (x *actorSystem) deleteGrainPlacement(ctx context.Context, grainID string) {
+	journal := x.getPlacementJournal()
+	if journal == nil {
+		return
+	}
+	if err := journal.Delete(ctx, x.PeersAddress(), grainID); err != nil {
+		x.logger.Errorf("node=%s failed to delete placement journal entry for grain=%s: %v (hint: check placement journal store)", x.PeersAddress(), grainID, err)
+	}
+}
+
 // getGrains returns the grains map of the actor system
 func (x *actorSystem) getGrains() *xsync.Map[string, *grainPID] {
 	x.locker.RLock()
@@ -2471,11 +2517,41 @@ func (x *actorSystem) putActorOnCluster(pid *PID) error {
 	if err != nil {
 		return err
 	}
+	x.recordActorPlacement(pid, actor)
 	select {
 	case x.actorsQueue <- actor:
 	case <-x.shutdownSignal:
 	}
 	return nil
+}
+
+// recordActorPlacement journals the given actor's placement on this node
+// when a placement journal is configured and the actor opted into
+// relocation. System actors are never journaled: they are recreated by
+// system startup, not by crash relocation. Recording failures are logged
+// and otherwise ignored - the journal is a best-effort crash-recovery aid
+// and must never block or fail an actor spawn.
+func (x *actorSystem) recordActorPlacement(pid *PID, wireActor *internalpb.Actor) {
+	journal := x.getPlacementJournal()
+	if journal == nil || pid.isStateSet(systemState) || !pid.IsRelocatable() {
+		return
+	}
+
+	payload, err := proto.Marshal(wireActor)
+	if err != nil {
+		x.logger.Errorf("node=%s failed to encode placement journal entry for actor=%s: %v", x.PeersAddress(), pid.ID(), err)
+		return
+	}
+
+	entry := &placement.Entry{
+		ID:      pid.ID(),
+		Node:    x.PeersAddress(),
+		Kind:    placement.KindActor,
+		Payload: payload,
+	}
+	if err := journal.Record(context.Background(), entry); err != nil {
+		x.logger.Errorf("node=%s failed to record placement journal entry for actor=%s: %v (hint: check placement journal store)", x.PeersAddress(), pid.ID(), err)
+	}
 }
 
 // putGrainOnCluster broadcasts the newly (re)activated grain into the
@@ -2488,11 +2564,39 @@ func (x *actorSystem) putGrainOnCluster(pid *grainPID) error {
 	if err != nil {
 		return err
 	}
+	x.recordGrainPlacement(grain)
 	select {
 	case x.grainsQueue <- grain:
 	case <-x.shutdownSignal:
 	}
 	return nil
+}
+
+// recordGrainPlacement journals the given grain's placement on this node
+// when a placement journal is configured and the grain did not opt out of
+// relocation. See recordActorPlacement for the failure-handling rationale.
+func (x *actorSystem) recordGrainPlacement(wireGrain *internalpb.Grain) {
+	journal := x.getPlacementJournal()
+	if journal == nil || isSystemName(wireGrain.GetGrainId().GetName()) || wireGrain.GetDisableRelocation() {
+		return
+	}
+
+	grainID := wireGrain.GetGrainId().GetValue()
+	payload, err := proto.Marshal(wireGrain)
+	if err != nil {
+		x.logger.Errorf("node=%s failed to encode placement journal entry for grain=%s: %v", x.PeersAddress(), grainID, err)
+		return
+	}
+
+	entry := &placement.Entry{
+		ID:      grainID,
+		Node:    x.PeersAddress(),
+		Kind:    placement.KindGrain,
+		Payload: payload,
+	}
+	if err := journal.Record(context.Background(), entry); err != nil {
+		x.logger.Errorf("node=%s failed to record placement journal entry for grain=%s: %v (hint: check placement journal store)", x.PeersAddress(), grainID, err)
+	}
 }
 
 // setupCluster prepares the cluster engine when clustering is enabled
@@ -3206,11 +3310,14 @@ func (x *actorSystem) handleNodeLeftEvent(event *cluster.Event) {
 		if !x.rebalancedNodes.Contains(nodeLeft.Address) {
 			x.rebalancedNodes.Add(nodeLeft.Address)
 
-			// fetch the peer state of the node that left from the cluster store
-			// and enqueue it for rebalancing
-			peerState, ok := x.clusterStore.GetPeerState(ctx, nodeLeft.Address)
+			// fetch the peer state of the node that left - either the state
+			// pushed by a graceful shutdown, or (when no such state exists and
+			// a placement journal is configured) a state synthesized by
+			// replaying that node's journaled placements - and enqueue it for
+			// rebalancing.
+			peerState, ok := x.resolveCrashedNodeState(ctx, nodeLeft.Address)
 			if !ok {
-				x.logger.Warnf("leader=%s could not find node=%s state in cluster store", x.String(), nodeLeft.Address)
+				x.logger.Warnf("leader=%s could not find node=%s state in cluster store or placement journal", x.String(), nodeLeft.Address)
 				return
 			}
 
@@ -3229,6 +3336,97 @@ func (x *actorSystem) handleNodeLeftEvent(event *cluster.Event) {
 	}
 
 	x.logger.Debugf("node=%s cleaned up node=%s left from state cache", x.String(), nodeLeft.Address)
+}
+
+// resolveCrashedNodeState returns the peer state to replay for a node that
+// left the cluster, together with whether any state was found.
+//
+// It first looks for state pushed by a graceful shutdown
+// (persistPeerStateToPeers via the cluster store). When a node crashes
+// (kill -9, OOM, hardware loss) that push never happens, so nothing will be
+// found there; if a placement journal is configured, this falls back to
+// synthesizing the peer state from that node's journaled placements instead,
+// extending relocation to nodes that never had a chance to shut down
+// gracefully.
+func (x *actorSystem) resolveCrashedNodeState(ctx context.Context, nodeAddress string) (*internalpb.PeerState, bool) {
+	if peerState, ok := x.clusterStore.GetPeerState(ctx, nodeAddress); ok {
+		return peerState, true
+	}
+
+	journal := x.getPlacementJournal()
+	if journal == nil {
+		return nil, false
+	}
+
+	peerState, err := x.buildPeerStateFromJournal(ctx, nodeAddress)
+	if err != nil {
+		x.logger.Errorf("node=%s failed to replay placement journal for node=%s: %v (hint: check placement journal store)", x.String(), nodeAddress, err)
+		return nil, false
+	}
+	if peerState == nil {
+		return nil, false
+	}
+	return peerState, true
+}
+
+// buildPeerStateFromJournal reconstructs a PeerState for nodeAddress from its
+// journaled placements, mirroring the shape preShutdown builds for a
+// gracefully departing node. It returns (nil, nil) when the journal has no
+// entries for nodeAddress, and a decode error for any entry is logged and
+// skipped rather than aborting the whole replay - a single corrupt or
+// stale entry should not block relocating every other journaled placement.
+func (x *actorSystem) buildPeerStateFromJournal(ctx context.Context, nodeAddress string) (*internalpb.PeerState, error) {
+	entries, err := x.getPlacementJournal().ListByNode(ctx, nodeAddress)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	host, portStr, err := net.SplitHostPort(nodeAddress)
+	if err != nil {
+		return nil, fmt.Errorf("invalid node address=%s in placement journal: %w", nodeAddress, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid node port in address=%s in placement journal: %w", nodeAddress, err)
+	}
+
+	wireActors := make(map[string]*internalpb.Actor)
+	wireGrains := make(map[string]*internalpb.Grain)
+
+	for _, entry := range entries {
+		switch entry.Kind {
+		case placement.KindActor:
+			wireActor := new(internalpb.Actor)
+			if err := proto.Unmarshal(entry.Payload, wireActor); err != nil {
+				x.logger.Errorf("node=%s failed to decode journaled actor=%s for node=%s: %v (hint: check placement journal payload)", x.String(), entry.ID, nodeAddress, err)
+				continue
+			}
+			wireActors[entry.ID] = wireActor
+		case placement.KindGrain:
+			wireGrain := new(internalpb.Grain)
+			if err := proto.Unmarshal(entry.Payload, wireGrain); err != nil {
+				x.logger.Errorf("node=%s failed to decode journaled grain=%s for node=%s: %v (hint: check placement journal payload)", x.String(), entry.ID, nodeAddress, err)
+				continue
+			}
+			wireGrains[entry.ID] = wireGrain
+		default:
+			x.logger.Warnf("node=%s ignoring journal entry=%s for node=%s with unknown kind=%v", x.String(), entry.ID, nodeAddress, entry.Kind)
+		}
+	}
+
+	if len(wireActors) == 0 && len(wireGrains) == 0 {
+		return nil, nil
+	}
+
+	return &internalpb.PeerState{
+		Host:      host,
+		PeersPort: int32(port), //nolint:gosec
+		Actors:    wireActors,
+		Grains:    wireGrains,
+	}, nil
 }
 
 // pruneRemoteWatchesForHost cleans up the remote watch registry after a
