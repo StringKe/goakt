@@ -23,7 +23,10 @@
 package actor
 
 import (
+	"sync"
 	"time"
+
+	"github.com/reugn/go-quartz/quartz"
 
 	"github.com/tochemey/goakt/v4/extension"
 	"github.com/tochemey/goakt/v4/hash"
@@ -104,6 +107,48 @@ func WithCluster(config *ClusterConfig) Option {
 			if config != nil {
 				a.clusterEnabled.Store(true)
 				a.clusterConfig = config
+			}
+		},
+	)
+}
+
+// WithSchedulerJobQueue configures the actor system's message scheduler to persist
+// scheduled jobs in queue instead of go-quartz's default in-memory queue, so that
+// schedules created via Schedule, ScheduleOnce, and ScheduleWithCron survive process
+// restarts and rolling deploys.
+//
+// GoAkt persists a serializable delivery intent rather than the scheduled job
+// closure: the target actor name, the message payload (encoded through the same
+// remoting serialization pipeline used for RemoteTell), and the trigger spec. At
+// fire time the target is re-resolved by name via ActorSystem.ActorOf, so delivery
+// keeps working even if the actor was respawned under a different PID. On Start,
+// the scheduler rebuilds its schedule-reference index from whatever jobs queue
+// already holds, which lets a persistent JobQueue implementation restore schedules
+// that were created by a previous process instance.
+//
+// Messages scheduled while a persistent queue is configured must implement
+// proto.Message; ErrScheduledMessageNotProto is returned otherwise.
+//
+// Because the target is re-resolved by name at fire time, this works best for
+// targets that ActorOf can find again after a restart: local actors and, in
+// cluster mode, actors registered under a stable name in the cluster directory.
+// Scheduling to a remote PID reached only through direct remoting (no cluster)
+// has no name to re-resolve against on this node, so the job will fail at fire
+// time; prefer the default in-memory queue for that case.
+//
+// GoAkt does not ship a concrete persistent JobQueue implementation. Queue and
+// locker pairs backed by SQL, Redis, or another durable store are expected to live
+// in separate adapter modules, following the same pattern as discovery.Provider
+// implementations. locker guards concurrent access to queue exactly as required by
+// quartz.WithQueue.
+//
+// Passing a nil queue or locker leaves the default in-memory queue in place.
+func WithSchedulerJobQueue(queue quartz.JobQueue, locker sync.Locker) Option {
+	return OptionFunc(
+		func(a *actorSystem) {
+			if queue != nil && locker != nil {
+				a.schedulerJobQueue = queue
+				a.schedulerJobQueueLocker = locker
 			}
 		},
 	)

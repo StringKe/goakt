@@ -162,6 +162,17 @@ var (
 	// ErrScheduledReferenceNotFound is returned when a reference to a scheduled job cannot be found.
 	ErrScheduledReferenceNotFound = errors.New("scheduled reference not found")
 
+	// ErrScheduledMessageNotProto is returned when scheduling a message on a scheduler
+	// backed by a persistent JobQueue (see WithSchedulerJobQueue) and the message does
+	// not implement proto.Message. Persistent schedules must be serializable through
+	// the remoting pipeline, which requires a concrete proto.Message.
+	ErrScheduledMessageNotProto = errors.New("scheduled message must implement proto.Message when a persistent scheduler job queue is configured")
+
+	// ErrInvalidScheduledMessage is returned when a persisted ScheduledMessage envelope
+	// cannot be decoded, either because its description is malformed or its trigger
+	// spec is missing or unrecognized.
+	ErrInvalidScheduledMessage = errors.New("invalid or corrupt scheduled message envelope")
+
 	// ErrGrainActivationFailure is returned when Grain activation failed
 	ErrGrainActivationFailure = errors.New("grain activation failed")
 

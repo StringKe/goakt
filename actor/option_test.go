@@ -24,9 +24,11 @@ package actor
 
 import (
 	"crypto/tls"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/reugn/go-quartz/quartz"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -138,6 +140,30 @@ func TestOption(t *testing.T) {
 			option: WithoutRelocation(),
 			check: func(t *testing.T, sys *actorSystem) {
 				assert.False(t, sys.relocationEnabled.Load())
+			},
+		},
+		{
+			name:   "WithSchedulerJobQueue",
+			option: WithSchedulerJobQueue(quartz.NewJobQueue(), &sync.Mutex{}),
+			check: func(t *testing.T, sys *actorSystem) {
+				assert.NotNil(t, sys.schedulerJobQueue)
+				assert.NotNil(t, sys.schedulerJobQueueLocker)
+			},
+		},
+		{
+			name:   "WithSchedulerJobQueue with nil queue is a no-op",
+			option: WithSchedulerJobQueue(nil, &sync.Mutex{}),
+			check: func(t *testing.T, sys *actorSystem) {
+				assert.Nil(t, sys.schedulerJobQueue)
+				assert.Nil(t, sys.schedulerJobQueueLocker)
+			},
+		},
+		{
+			name:   "WithSchedulerJobQueue with nil locker is a no-op",
+			option: WithSchedulerJobQueue(quartz.NewJobQueue(), nil),
+			check: func(t *testing.T, sys *actorSystem) {
+				assert.Nil(t, sys.schedulerJobQueue)
+				assert.Nil(t, sys.schedulerJobQueueLocker)
 			},
 		},
 	}

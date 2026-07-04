@@ -40,6 +40,7 @@ import (
 
 	goset "github.com/deckarep/golang-set/v2"
 	"github.com/flowchartsman/retry"
+	"github.com/reugn/go-quartz/quartz"
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.uber.org/atomic"
@@ -861,6 +862,14 @@ type actorSystem struct {
 	// specifies the message scheduler
 	scheduler *scheduler
 
+	// specifies an optional externally-provided durable queue backing the message
+	// scheduler, configured via WithSchedulerJobQueue. When nil, the scheduler uses
+	// go-quartz's default in-memory queue and behaves exactly as before this option
+	// existed. When set, schedules created via Schedule, ScheduleOnce, and
+	// ScheduleWithCron survive process restarts.
+	schedulerJobQueue       quartz.JobQueue
+	schedulerJobQueueLocker sync.Locker
+
 	// dispatcher drives the shared worker pool that processes actor
 	// mailboxes. Created in Start, torn down non-blockingly in shutdown.
 	dispatcher *dispatcher
@@ -1135,7 +1144,7 @@ func (x *actorSystem) Start(ctx context.Context) error {
 	// the one a prior teardown already closed.
 	x.shutdownSignal = make(chan types.Unit)
 
-	x.scheduler = newScheduler(x.logger, x.shutdownTimeout, x)
+	x.scheduler = newScheduler(x.logger, x.shutdownTimeout, x, x.schedulerJobQueue, x.schedulerJobQueueLocker)
 
 	x.dispatcher.start()
 
