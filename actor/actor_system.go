@@ -70,6 +70,7 @@ import (
 	"github.com/tochemey/goakt/v4/internal/types"
 	"github.com/tochemey/goakt/v4/internal/validation"
 	"github.com/tochemey/goakt/v4/internal/xsync"
+	"github.com/tochemey/goakt/v4/kv"
 	"github.com/tochemey/goakt/v4/log"
 	"github.com/tochemey/goakt/v4/memory"
 	"github.com/tochemey/goakt/v4/passivation"
@@ -714,6 +715,35 @@ type ActorSystem interface {
 	//       system.Logger().Info("no cluster leader is currently elected")
 	//   }
 	Leader(ctx context.Context) (leader *remote.Peer, err error)
+	// KV returns a cluster-scoped key/value registry and distributed lock backed by
+	// the actor system's embedded cluster engine.
+	//
+	// KV is positioned as a registry for application metadata -- ownership records,
+	// idempotency/dedup keys, short-lived coordination locks -- and not as a
+	// general-purpose cache.
+	//
+	// Behavior:
+	//   - Requires cluster mode. If clustering is disabled, nil is returned along
+	//     with ErrClusterDisabled.
+	//
+	// Possible Errors:
+	//   - ErrActorSystemNotStarted: The actor system has not been started.
+	//   - ErrClusterDisabled: Clustering is not enabled for this node.
+	//
+	// Example:
+	//   store, err := system.KV()
+	//   if err != nil {
+	//       system.Logger().Errorf("cluster key/value registry unavailable: %v", err)
+	//       return
+	//   }
+	//
+	//   lock, err := store.TryLock(ctx, "cert:example.com", 30*time.Second)
+	//   if err != nil {
+	//       system.Logger().Warnf("another node already holds the lock: %v", err)
+	//       return
+	//   }
+	//   defer lock.Unlock(ctx)
+	KV() (kv.Store, error)
 	// DataCenterReady reports whether the multi-datacenter controller is operational.
 	//
 	// The controller is considered ready when:
@@ -1431,6 +1461,21 @@ func (x *actorSystem) Leader(ctx context.Context) (leader *remote.Peer, err erro
 
 	leader = cluster.ToRemotePeer(members[0])
 	return leader, nil
+}
+
+// KV returns a cluster-scoped key/value registry and distributed lock backed by the
+// actor system's embedded cluster engine. See the ActorSystem interface documentation
+// for details and possible errors.
+func (x *actorSystem) KV() (kv.Store, error) {
+	if !x.Running() {
+		return nil, gerrors.ErrActorSystemNotStarted
+	}
+
+	if !x.clusterEnabled.Load() {
+		return nil, gerrors.ErrClusterDisabled
+	}
+
+	return &kvStore{system: x}, nil
 }
 
 // DiscoveryPort returns the port used for service discovery.
