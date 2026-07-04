@@ -81,6 +81,18 @@ go test -run=^$ -bench=^BenchmarkPubSubBridgeDelivery$ -count=10 ./benchmark/
 go test -run=^$ -bench=^BenchmarkRemoteTellThroughput$ -benchtime=1x ./benchmark/
 ```
 
+### JobsEnqueue — jobs.NewMemoryStore Enqueue throughput
+
+```
+go test -run=^$ -bench=^BenchmarkJobsEnqueue$ -count=10 -benchmem ./benchmark/
+```
+
+### JobsLease — jobs.NewMemoryStore Lease throughput
+
+```
+go test -run=^$ -bench=^BenchmarkJobsLease$ -count=10 -benchmem ./benchmark/
+```
+
 ### MillionActorsSustainedLoad — 1M actors processing under sustained load
 
 A single-node scale test (not a benchmark) that spawns one million actors,
