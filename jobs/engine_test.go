@@ -117,7 +117,7 @@ func newFlakyActor(failuresBeforeSuccess int64) *flakyActor {
 }
 
 func (a *flakyActor) PreStart(*actor.Context) error { return nil }
-func (a *flakyActor) PostStop(*actor.Context) error  { return nil }
+func (a *flakyActor) PostStop(*actor.Context) error { return nil }
 func (a *flakyActor) Receive(ctx *actor.ReceiveContext) {
 	switch ctx.Message().(type) {
 	case *testpb.TestSum:

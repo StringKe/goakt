@@ -123,8 +123,8 @@ type Engine struct {
 	batchSize    int
 	askTimeout   time.Duration
 
-	owner string
-	sem   chan struct{}
+	owner  string
+	sem    chan struct{}
 	logger log.Logger
 
 	started *atomic.Bool
