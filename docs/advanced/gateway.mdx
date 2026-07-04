@@ -1,0 +1,208 @@
+---
+title: Gateway
+description: Turn a GoAkt cluster into a single, cluster-aware ingress tier for HTTP, WebSocket, and SSE traffic.
+sidebarTitle: "Gateway"
+---
+
+The `gateway` package makes a GoAkt cluster act as its own ingress tier — the role an
+nginx/caddy front-tier normally plays in front of a stateless HTTP fleet — for two
+things specifically: terminating TLS for domains shared cluster-wide, and giving
+long-lived WebSocket/SSE connections an addressable identity so any node can deliver a
+message to them.
+
+<Note>
+`gateway` is entirely additive: it is a new top-level package built on top of existing
+GoAkt primitives (the cluster KV store, distributed lock, cluster-single-fire schedules,
+and the pub/sub bridge). It changes nothing about default `ActorSystem` behavior.
+</Note>
+
+## Design boundary: actors only where they earn their keep
+
+- **Plain HTTP requests are ordinary `net/http` handlers.** Nothing in this package puts
+  an actor in the path of a request/response cycle that lives for a few milliseconds —
+  that would be pure overhead.
+- **Only long-lived WebSocket/SSE connections get an addressable identity.** Each
+  accepted connection is registered in a local [`Registry`](#registry-and-two-tier-delivery)
+  and backed by a lightweight [ephemeral actor](/actor/ephemeral-actors) whose only job
+  is to relay a delivery to the socket it owns when another node needs to reach it.
+
+## Registry and two-tier delivery
+
+`Registry` is the local, per-node table of registered connections and the core of the
+package's delivery model:
+
+```go
+registry := gateway.NewRegistry(actorSystem, logger)
+```
+
+`Registry.SendToConnection` and `Registry.Broadcast` both follow the same two-tier shape:
+
+1. **Local hit: write directly.** If the target connection (or, for broadcast, a topic
+   member) is registered on this node, the payload is written straight to the socket —
+   no actor mailbox, no cluster lookup.
+2. **Local miss: cluster fallback.** Only when the connection is not held locally does
+   `Registry` resolve it through the cluster-aware actor directory
+   (`ActorSystem.ActorOf`) and deliver remotely. For `Broadcast`, remote topic members are
+   reached through the [pub/sub bridge](/advanced/pubsub-bridge)
+   (`ActorSystem.SubscribeTopic`).
+
+```go
+err := registry.SendToConnection(ctx, connectionID, payload)
+// ErrConnectionNotFound if connectionID is not registered anywhere in the cluster.
+
+err = registry.Broadcast(ctx, "room-42", payload)
+```
+
+This means cross-node messaging — the only scenario that needs any cluster machinery at
+all — is opt-in by construction: a single-node deployment, or a multi-node one where
+every handler happens to run on the connection's own node, never touches
+`ActorSystem.ActorOf` or pub/sub.
+
+## WebSocket and SSE listeners
+
+`NewWSHandler` and `NewSSEHandler` return ordinary `http.Handler` values you mount like
+any other route:
+
+```go
+mux := http.NewServeMux()
+mux.Handle("/ws", gateway.NewWSHandler(registry,
+    gateway.WithWSIDFunc(func(r *http.Request) string { return r.URL.Query().Get("user_id") }),
+    gateway.WithWSAuthFunc(verifyBearerToken),
+    gateway.WithWSTopics(func(r *http.Request) []string { return []string{roomOf(r)} }),
+    gateway.WithWSOnMessage(func(ctx context.Context, id string, payload []byte) {
+        handleInbound(ctx, id, payload)
+    }),
+))
+mux.Handle("/events", gateway.NewSSEHandler(registry,
+    gateway.WithSSEIDFunc(func(r *http.Request) string { return r.URL.Query().Get("user_id") }),
+))
+```
+
+Both handlers share the same shape:
+
+| Concern | How it's covered |
+|---|---|
+| Auth | `WithWSAuthFunc`/`WithSSEAuthFunc` run during the handshake/request; a non-nil error rejects the connection (403). |
+| Backpressure | Each connection gets a fixed-size outbound buffer (`WithWSSendBuffer`/`WithSSESendBuffer`, default 256). A full buffer returns `ErrBackpressure` from `SendToConnection`/`Broadcast` instead of blocking the caller. |
+| Clean shutdown | The connection is always unregistered (and its ephemeral actor stopped) when the socket closes, whether the client disconnected or the handler's read loop returned. |
+| Topic grouping | `WithWSTopics`/`WithSSETopics` join the connection to one or more `Registry` topics at registration time, for use with `Broadcast`. |
+
+SSE is one-way (server to client); if your application needs inbound data from an SSE
+client, pair the stream with an ordinary HTTP endpoint the client posts to.
+
+## Cluster-shared TLS
+
+`Manager` lets every node in the cluster terminate TLS for any hosted domain from one
+certificate, issued exactly once cluster-wide, following the model
+[caddy/certmagic](https://github.com/caddyserver/certmagic) uses for cluster storage:
+
+```go
+manager := gateway.NewManager(actorSystem, logger,
+    gateway.WithCertIssuer(issuer),
+    gateway.WithCertStore(myPersistentStore), // optional; defaults to in-memory
+    gateway.WithAllowedDomains("chat.example.com", "api.example.com"),
+    gateway.WithRenewBefore(30*24*time.Hour), // default
+)
+
+if err := manager.Start(ctx); err != nil { // registers the renewal schedule
+    log.Fatal(err)
+}
+defer manager.Stop(ctx)
+
+tlsConfig := manager.TLSConfig() // GetCertificate wired for SNI lookup
+```
+
+- **Issuance arbitration.** The first request for a domain (or the renewal schedule
+  finding one close to expiry) races a `kv.Store.TryLock` for that domain; only the
+  winner calls the configured `CertIssuer`. Losers poll the cluster KV store until the
+  winner publishes, or give up with `ErrIssuanceTimeout`.
+- **Distribution.** The issued certificate is written to the cluster KV store (so every
+  node can serve it immediately) and to the configured `CertStore` (so a single-node
+  restart doesn't need the cluster at all). `CertStore` defaults to an in-memory
+  implementation; plug in a persistent one to survive a full cluster cold start without
+  re-issuing.
+- **Renewal.** Driven by a [`WithClusterSingleFire`](/actor/scheduling#cluster-wide-single-fire)
+  cron schedule (default: hourly checks, configurable via `WithRenewInterval`), so
+  exactly one node re-checks/re-issues per tick regardless of cluster size.
+- **SNI lookup.** `Manager.GetCertificate` implements the `tls.Config.GetCertificate`
+  signature directly, so `tlsConfig.GetCertificate = manager.GetCertificate` (or
+  `manager.TLSConfig()`) is all a listener needs.
+
+### Certificate issuers
+
+`CertIssuer` is a one-method interface:
+
+```go
+type CertIssuer interface {
+    Issue(ctx context.Context, domain string) (*Certificate, error)
+}
+```
+
+Two implementations ship with the package:
+
+- **`StaticIssuer`** serves a fixed, pre-provisioned certificate — useful for
+  development or when certificates are provisioned out of band.
+- **`CloudflareOriginCAIssuer`** calls the
+  [Cloudflare Origin CA API](https://developers.cloudflare.com/ssl/origin-configuration/origin-ca/)
+  over plain `net/http` — no Cloudflare SDK dependency. Pair it with
+  `gateway.NewRSACertificateRequest` to generate the CSR/key locally:
+
+```go
+issuer := &gateway.CloudflareOriginCAIssuer{
+    APIToken:           os.Getenv("CF_ORIGIN_CA_KEY"),
+    RequestCertificate: gateway.NewRSACertificateRequest(2048),
+}
+```
+
+<Tip>
+An ACME issuer is a natural third `CertIssuer` implementation (e.g. backed by
+`golang.org/x/crypto/acme`, evaluated separately for the dependency tree) but is not
+shipped in this initial version — the interface is intentionally minimal so it drops in
+without any change to `Manager`.
+</Tip>
+
+## Authenticated Origin Pulls
+
+If traffic only ever reaches your gateway through Cloudflare, `AuthenticatedOriginPulls`
+adds mTLS verification that inbound connections present Cloudflare's origin-pull client
+certificate:
+
+```go
+pulls := &gateway.AuthenticatedOriginPulls{CAPEM: cloudflareOriginPullCA}
+
+server, err := gateway.NewServer(":8443", mux,
+    gateway.WithTLSManager(manager),
+    gateway.WithAuthenticatedOriginPulls(pulls),
+)
+```
+
+<Warning>
+`CAPEM` is supplied by the caller rather than embedded in the library, so deployments
+track Cloudflare's currently published origin-pull CA bundle instead of trusting a copy
+vendored into GoAkt.
+</Warning>
+
+## Putting it together: `Server`
+
+`Server` is an optional, thin wrapper around `*http.Server` that wires a `Manager`'s TLS
+configuration (and, optionally, Authenticated Origin Pulls) into the standard library's
+TLS listener:
+
+```go
+server, err := gateway.NewServer(":8443", mux, gateway.WithTLSManager(manager))
+if err != nil {
+    log.Fatal(err)
+}
+log.Fatal(server.ListenAndServe(ctx))
+```
+
+Using `Server` is entirely optional — any application already managing its own
+`*http.Server` can instead set `TLSConfig: manager.TLSConfig()` directly and mount
+`NewWSHandler`/`NewSSEHandler` like any other route.
+
+## See also
+
+- [Ephemeral Actors](/actor/ephemeral-actors) — the `WithEphemeral` spawn option backing every registered connection
+- [PubSub Bridge](/advanced/pubsub-bridge) — the non-actor subscription primitive `Registry.Broadcast` uses for cross-node fan-out
+- [Cluster KV Store](/clustering/kv-store) — the `kv.Store` primitive `Manager` uses for issuance arbitration and certificate distribution
+- A runnable sample lives in `playground/gateway-echo` in the repository: a WebSocket echo server plus a cross-instance `SendToConnection` demo.
