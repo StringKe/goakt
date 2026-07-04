@@ -121,13 +121,58 @@ Cron expressions are evaluated in the **local timezone** of the process (`time.N
 
 For scheduled messages, the target actor receives the message via `Tell`. By default, `ctx.Sender()` is `nil` (NoSender). Use `WithSender(pid)` if you want the target to know which actor scheduled the message.
 
+## Persistent Scheduling
+
+By default, scheduled messages live in an in-memory [go-quartz](https://github.com/reugn/go-quartz) queue: they are lost on process restart or rolling deploy, and are node-local in cluster mode. Use `WithSchedulerJobQueue` to back the scheduler with a durable [`quartz.JobQueue`](https://pkg.go.dev/github.com/reugn/go-quartz/quartz#JobQueue) instead.
+
+```go
+system, err := actor.NewActorSystem("my-system",
+    actor.WithSchedulerJobQueue(myPersistentQueue, myQueueLocker),
+)
+```
+
+<Note>
+GoAkt does not ship a concrete persistent `JobQueue` implementation. Bring your own (SQL, Redis, etc.), following the same pattern as `discovery.Provider` implementations in the wider ecosystem.
+</Note>
+
+### How it works
+
+Scheduled job closures cannot be serialized, so instead of persisting the closure GoAkt persists a delivery **intent**: an internal `ScheduledMessage` envelope carrying the target actor's name, the message payload (encoded through the same remoting serialization pipeline used by `RemoteTell`), the sender's name (if any), and the trigger spec (once/interval/cron + timezone).
+
+- **At schedule time**, `ScheduleOnce`, `Schedule`, and `ScheduleWithCron` build this envelope and hand it to the configured `JobQueue` via `quartz.WithQueue`.
+- **At fire time**, the target actor is re-resolved by name through `ActorOf`, so delivery works even if the actor was respawned under a different PID — including after this process restarted and a new instance picked up the persisted queue.
+- **On `Start`**, the scheduler rebuilds its internal reference index (used by `CancelSchedule`, `PauseSchedule`, `ResumeSchedule`) from whatever jobs the queue already holds, so schedules created by a previous process instance become manageable again.
+- **On `Stop`**, pending jobs are left in the queue instead of being cleared — clearing would defeat the purpose of a durable queue.
+
+<Warning>
+Messages scheduled while a persistent queue is configured must implement `proto.Message`; `ErrScheduledMessageNotProto` is returned otherwise. This mirrors the existing constraint on remoting.
+</Warning>
+
+<Warning>
+Because the target is re-resolved by name at fire time, persistent scheduling works best for local actors and, in cluster mode, actors registered under a stable name in the cluster directory. Scheduling to a remote PID reached only through direct remoting (no cluster) has no name to re-resolve against on this node, so the job fails at fire time — use the default in-memory queue for that case.
+</Warning>
+
+### Building a custom JobQueue
+
+A `JobQueue` implementation that persists jobs across restarts needs to turn its stored bytes back into an executable `quartz.Job` on load. GoAkt exports the pieces needed to do that without understanding its internal types:
+
+| Function                                             | Purpose                                                                          |
+|-------------------------------------------------------|-----------------------------------------------------------------------------------|
+| `actor.NewScheduledMessageJob(system, envelope)`      | Builds an executable `quartz.Job` from a `ScheduledMessage` envelope             |
+| `actor.DecodeScheduledMessage(description)`           | Decodes a job's `Description()` string back into its `ScheduledMessage` envelope |
+| `actor.ScheduledMessageTrigger(envelope)`             | Rebuilds the `quartz.Trigger` (once/interval/cron) described by the envelope     |
+
+A typical `Push` implementation stores `job.JobDetail().Job().Description()` (an opaque, storable string) together with the job key and next-run time; a typical `Get`/`Head`/`Pop` implementation reads those bytes back, calls `DecodeScheduledMessage` and `ScheduledMessageTrigger`, and passes the result to `NewScheduledMessageJob` to get back an executable job.
+
 ## Errors
 
-| Error                           | Condition                                                      |
-|---------------------------------|----------------------------------------------------------------|
-| `ErrSchedulerNotStarted`        | Actor system not started; scheduler is started with the system |
-| `ErrScheduledReferenceNotFound` | Cancel, pause, or resume called with an unknown reference      |
-| `ErrRemotingDisabled`           | Scheduling to a remote PID when remoting is not enabled        |
+| Error                            | Condition                                                                     |
+|-----------------------------------|--------------------------------------------------------------------------------|
+| `ErrSchedulerNotStarted`         | Actor system not started; scheduler is started with the system                |
+| `ErrScheduledReferenceNotFound`  | Cancel, pause, or resume called with an unknown reference                     |
+| `ErrRemotingDisabled`            | Scheduling to a remote PID when remoting is not enabled                       |
+| `ErrScheduledMessageNotProto`    | Scheduling a non-`proto.Message` while a persistent job queue is configured   |
+| `ErrInvalidScheduledMessage`     | A persisted `ScheduledMessage` envelope is missing or cannot be decoded        |
 
 ## Delivery Semantics
 

@@ -32,10 +32,14 @@ import (
 	quartzlogger "github.com/reugn/go-quartz/logger"
 	"github.com/reugn/go-quartz/quartz"
 	"go.uber.org/atomic"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/tochemey/goakt/v4/errors"
+	"github.com/tochemey/goakt/v4/internal/internalpb"
 	"github.com/tochemey/goakt/v4/internal/xsync"
 	"github.com/tochemey/goakt/v4/log"
+	"github.com/tochemey/goakt/v4/remote"
 )
 
 // scheduler defines the Go-Akt scheduler.
@@ -56,10 +60,18 @@ type scheduler struct {
 	// actorSystem is needed to resolve NoSender() for remote-PID schedules,
 	// since remote PIDs carry no actor-system reference.
 	actorSystem ActorSystem
+	// persistent is true when jobQueue was supplied via WithSchedulerJobQueue.
+	// It switches ScheduleOnce/Schedule/ScheduleWithCron from wrapping a
+	// non-serializable closure to persisting a ScheduledMessage envelope, and
+	// makes Start rebuild scheduledKeys from whatever the queue already holds.
+	persistent bool
 }
 
-// newScheduler creates an instance of scheduler
-func newScheduler(logger log.Logger, shutdownTimeout time.Duration, system ActorSystem) *scheduler {
+// newScheduler creates an instance of scheduler. jobQueue and queueLocker are
+// optional (see WithSchedulerJobQueue); when either is nil the scheduler keeps
+// go-quartz's default in-memory queue and behaves exactly as before this
+// option existed.
+func newScheduler(logger log.Logger, shutdownTimeout time.Duration, system ActorSystem, jobQueue quartz.JobQueue, queueLocker sync.Locker) *scheduler {
 	// create an instance of quartz scheduler with logger off
 	// Set a high OutdatedThreshold to prevent RunOnceTrigger jobs from being
 	// silently dropped when they become "outdated" (scheduled time passed).
@@ -68,10 +80,17 @@ func newScheduler(logger log.Logger, shutdownTimeout time.Duration, system Actor
 	// 2. If the job becomes outdated, go-quartz tries to reschedule it
 	// 3. The already-expired trigger returns an error, causing the job to be dropped
 	// By setting a 24-hour threshold, we ensure jobs are executed even if delayed.
-	quartzScheduler, _ := quartz.NewStdScheduler(
+	opts := []quartz.SchedulerOpt{
 		quartz.WithLogger(quartzlogger.NewSimpleLogger(nil, quartzlogger.LevelOff)),
-		quartz.WithOutdatedThreshold(24*time.Hour),
-	)
+		quartz.WithOutdatedThreshold(24 * time.Hour),
+	}
+
+	persistent := jobQueue != nil && queueLocker != nil
+	if persistent {
+		opts = append(opts, quartz.WithQueue(jobQueue, queueLocker))
+	}
+
+	quartzScheduler, _ := quartz.NewStdScheduler(opts...)
 
 	// create an instance of scheduler
 	scheduler := &scheduler{
@@ -82,6 +101,7 @@ func newScheduler(logger log.Logger, shutdownTimeout time.Duration, system Actor
 		shutdownTimeout: shutdownTimeout,
 		scheduledKeys:   xsync.NewMap[string, *quartz.JobKey](),
 		actorSystem:     system,
+		persistent:      persistent,
 	}
 
 	// return the instance of the scheduler
@@ -95,7 +115,38 @@ func (x *scheduler) Start(ctx context.Context) {
 	x.logger.Info("starting messages scheduler...")
 	x.quartzScheduler.Start(ctx)
 	x.started.Store(x.quartzScheduler.IsStarted())
+	if x.persistent {
+		x.rebuildScheduledKeys()
+	}
 	x.logger.Info("messages scheduler started.:)")
+}
+
+// rebuildScheduledKeys repopulates scheduledKeys from whatever the persistent
+// JobQueue already holds. This is what lets schedules created by a previous
+// process instance (and restored into the queue by its implementation) become
+// manageable again via CancelSchedule/PauseSchedule/ResumeSchedule after a
+// restart.
+func (x *scheduler) rebuildScheduledKeys() {
+	jobKeys, err := x.quartzScheduler.GetJobKeys()
+	if err != nil {
+		x.logger.Error(fmt.Errorf("failed to list persisted scheduled jobs: %w", err))
+		return
+	}
+
+	for _, jobKey := range jobKeys {
+		scheduledJob, err := x.quartzScheduler.GetScheduledJob(jobKey)
+		if err != nil {
+			x.logger.Error(fmt.Errorf("failed to load persisted job key=%s: %w", jobKey.String(), err))
+			continue
+		}
+
+		msgJob, ok := scheduledJob.JobDetail().Job().(*scheduledMessageJob)
+		if !ok {
+			continue
+		}
+
+		x.scheduledKeys.Set(msgJob.envelope.GetReference(), jobKey)
+	}
 }
 
 // Stop stops the scheduler
@@ -107,7 +158,13 @@ func (x *scheduler) Stop(ctx context.Context) {
 	x.logger.Info("stopping messages scheduler...")
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	_ = x.quartzScheduler.Clear()
+	// With a persistent JobQueue, pending jobs must survive Stop so Start can
+	// rebuild scheduledKeys from them again; Clear would erase the whole point
+	// of configuring a durable queue. With the default in-memory queue, Clear
+	// keeps prior behavior of dropping everything on Stop.
+	if !x.persistent {
+		_ = x.quartzScheduler.Clear()
+	}
 	x.quartzScheduler.Stop()
 	x.started.Store(x.quartzScheduler.IsStarted())
 
@@ -149,13 +206,18 @@ func (x *scheduler) ScheduleOnce(message any, to *PID, delay time.Duration, opts
 	}
 
 	senderConfig := newScheduleConfig(opts...)
-	jobFn := x.makeJobFn(to, message, senderConfig)
-
 	reference := senderConfig.Reference()
 	jobKey := quartz.NewJobKey(reference)
-	x.scheduledKeys.Set(reference, jobKey)
 
-	detail := quartz.NewJobDetail(job.NewFunctionJob(jobFn), jobKey)
+	triggerSpec := &internalpb.ScheduleTrigger{
+		Kind: &internalpb.ScheduleTrigger_Once{Once: &internalpb.OnceTrigger{Delay: durationpb.New(delay)}},
+	}
+	detail, err := x.buildJobDetail(to, message, senderConfig, jobKey, triggerSpec)
+	if err != nil {
+		return err
+	}
+
+	x.scheduledKeys.Set(reference, jobKey)
 	return x.quartzScheduler.ScheduleJob(detail, quartz.NewRunOnceTrigger(delay))
 }
 
@@ -190,13 +252,18 @@ func (x *scheduler) Schedule(message any, to *PID, interval time.Duration, opts 
 	}
 
 	senderConfig := newScheduleConfig(opts...)
-	jobFn := x.makeJobFn(to, message, senderConfig)
-
 	reference := senderConfig.Reference()
 	jobKey := quartz.NewJobKey(reference)
-	x.scheduledKeys.Set(reference, jobKey)
 
-	detail := quartz.NewJobDetail(job.NewFunctionJob(jobFn), jobKey)
+	triggerSpec := &internalpb.ScheduleTrigger{
+		Kind: &internalpb.ScheduleTrigger_Interval{Interval: &internalpb.IntervalTrigger{Interval: durationpb.New(interval)}},
+	}
+	detail, err := x.buildJobDetail(to, message, senderConfig, jobKey, triggerSpec)
+	if err != nil {
+		return err
+	}
+
+	x.scheduledKeys.Set(reference, jobKey)
 	return x.quartzScheduler.ScheduleJob(detail, quartz.NewSimpleTrigger(interval))
 }
 
@@ -231,13 +298,9 @@ func (x *scheduler) ScheduleWithCron(message any, to *PID, cronExpression string
 	}
 
 	senderConfig := newScheduleConfig(opts...)
-	jobFn := x.makeJobFn(to, message, senderConfig)
-
 	reference := senderConfig.Reference()
 	jobKey := quartz.NewJobKey(reference)
-	x.scheduledKeys.Set(reference, jobKey)
 
-	detail := quartz.NewJobDetail(job.NewFunctionJob(jobFn), jobKey)
 	location := time.Now().Location()
 	trigger, err := quartz.NewCronTriggerWithLoc(cronExpression, location)
 	if err != nil {
@@ -245,6 +308,15 @@ func (x *scheduler) ScheduleWithCron(message any, to *PID, cronExpression string
 		return err
 	}
 
+	triggerSpec := &internalpb.ScheduleTrigger{
+		Kind: &internalpb.ScheduleTrigger_Cron{Cron: &internalpb.CronTrigger{Expression: cronExpression, Timezone: location.String()}},
+	}
+	detail, err := x.buildJobDetail(to, message, senderConfig, jobKey, triggerSpec)
+	if err != nil {
+		return err
+	}
+
+	x.scheduledKeys.Set(reference, jobKey)
 	return x.quartzScheduler.ScheduleJob(detail, trigger)
 }
 
@@ -342,4 +414,51 @@ func (x *scheduler) makeJobFn(to *PID, message any, cfg *scheduleConfig) func(ct
 		err := sender.Tell(ctx, to, message)
 		return err == nil, err
 	}
+}
+
+// buildJobDetail returns the quartz.JobDetail to schedule for to/message/cfg.
+// When no persistent JobQueue is configured, it wraps a plain closure exactly
+// as before this option existed. When a persistent JobQueue is configured, it
+// instead builds a ScheduledMessage envelope and wraps it in a
+// scheduledMessageJob, so the job can be persisted and rebuilt after a restart.
+func (x *scheduler) buildJobDetail(to *PID, message any, cfg *scheduleConfig, jobKey *quartz.JobKey, triggerSpec *internalpb.ScheduleTrigger) (*quartz.JobDetail, error) {
+	if !x.persistent {
+		jobFn := x.makeJobFn(to, message, cfg)
+		return quartz.NewJobDetail(job.NewFunctionJob(jobFn), jobKey), nil
+	}
+
+	envelope, err := x.buildEnvelope(to, message, cfg, triggerSpec)
+	if err != nil {
+		return nil, err
+	}
+	return quartz.NewJobDetail(NewScheduledMessageJob(x.actorSystem, envelope), jobKey), nil
+}
+
+// buildEnvelope serializes message through the same remoting pipeline used for
+// RemoteTell and packages it, along with the target/sender names and trigger
+// spec, into a ScheduledMessage envelope that a persistent JobQueue can store.
+func (x *scheduler) buildEnvelope(to *PID, message any, cfg *scheduleConfig, triggerSpec *internalpb.ScheduleTrigger) (*internalpb.ScheduledMessage, error) {
+	protoMessage, ok := message.(proto.Message)
+	if !ok {
+		return nil, errors.ErrScheduledMessageNotProto
+	}
+
+	payload, err := remote.NewProtoSerializer().Serialize(protoMessage)
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize scheduled message: %w", err)
+	}
+
+	envelope := &internalpb.ScheduledMessage{
+		Reference:  cfg.Reference(),
+		TargetName: to.Name(),
+		Payload:    payload,
+		Trigger:    triggerSpec,
+	}
+
+	noSender := x.actorSystem.NoSender()
+	if sender := cfg.Sender(); sender != nil && !sender.Equals(noSender) {
+		envelope.SenderName = sender.Name()
+	}
+
+	return envelope, nil
 }
