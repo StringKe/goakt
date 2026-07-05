@@ -57,39 +57,48 @@ type Filter struct {
 //     one caller must not be handed to another until its lease expires or it
 //     is Ack/Nack/DeadLetter'd. Lease also reclaims any job whose previous
 //     LeaseExpiresAt has passed -- this is what makes a crashed worker's jobs
-//     redeliver automatically. A StateWaiting parent is never returned by
-//     Lease; it only becomes leasable once every child has completed and it
-//     has been moved back to StatePending by the child-completion logic
-//     described under Ack/Nack/DeadLetter.
+//     redeliver automatically. Every successful grant or reclaim assigns a new
+//     LeaseToken (monotonically increasing, unique per Store instance), which
+//     the caller must present back to Ack/Nack/DeadLetter: this is the fencing
+//     token that stops a worker whose lease already expired and was reclaimed
+//     from finalizing the job out from under its new owner. A StateWaiting
+//     parent is never returned by Lease; it only becomes leasable once every
+//     child has completed and it has been moved back to StatePending by the
+//     child-completion logic described under Ack/Nack/DeadLetter.
 //
-//  4. Ack is a terminal, idempotent success transition: a second Ack on an
-//     already-succeeded job is a no-op returning nil. When the job has a
-//     non-empty ParentID, Ack additionally records result against the parent
-//     (see point 6).
+//  4. Ack is a terminal success transition, gated by the fencing token: it
+//     returns ErrStaleLease, without mutating the job, when token does not
+//     match the job's current LeaseToken or the job is already in a terminal
+//     state (StateSucceeded or StateDeadLetter) -- this is what stops a late
+//     Ack from resurrecting a dead-lettered job or double-recording a fan-out
+//     child's result. When the job has a non-empty ParentID, a successful Ack
+//     additionally records result against the parent (see point 6).
 //
-//  5. Nack increments Attempts and either reschedules the job at
-//     now+RetryPolicy.NextDelay(Attempts) (back to StatePending) or, once
-//     Attempts reaches RetryPolicy.MaxAttempts, moves it to StateDeadLetter --
-//     in which case it cascades into the parent exactly like DeadLetter
-//     (point 6).
+//  5. Nack is gated by the same fencing check as Ack (ErrStaleLease on token
+//     mismatch or an already-terminal job). Otherwise it increments Attempts
+//     and either reschedules the job at now+RetryPolicy.NextDelay(Attempts)
+//     (back to StatePending) or, once Attempts reaches
+//     RetryPolicy.MaxAttempts, moves it to StateDeadLetter -- in which case it
+//     cascades into the parent exactly like DeadLetter (point 6).
 //
-//  6. DeadLetter forces the dead-letter transition regardless of Attempts,
-//     and is idempotent. When the job has a non-empty ParentID, the Store
-//     decrements the parent's outstanding child counter and records the
-//     child's result. Once every child has reached a terminal state, the
-//     parent leaves StateWaiting: if every child succeeded, the parent moves
-//     to StatePending with ChildResults populated (ordered by ChildIndex),
-//     ready for its reduce-step delivery; if any child was dead-lettered, the
-//     parent moves straight to StateDeadLetter without waiting for its
-//     remaining siblings -- a fan-out is only as strong as its weakest child.
+//  6. DeadLetter is gated by the same fencing check as Ack, then forces the
+//     dead-letter transition regardless of Attempts. When the job has a
+//     non-empty ParentID, the Store decrements the parent's outstanding child
+//     counter and records the child's result. Once every child has reached a
+//     terminal state, the parent leaves StateWaiting: if every child
+//     succeeded, the parent moves to StatePending with ChildResults populated
+//     (ordered by ChildIndex), ready for its reduce-step delivery; if any
+//     child was dead-lettered, the parent moves straight to StateDeadLetter
+//     without waiting for its remaining siblings -- a fan-out is only as
+//     strong as its weakest child.
 //
 //  7. Delete removes a job (and, if the job is a fan-out parent, its
 //     bookkeeping) regardless of state.
 //
 //  8. Requeue resets a job (typically dead-lettered) back to StatePending
-//     with Attempts reset to zero and AvailableAt set to now; it is the
-//     primitive behind Inspector.Retry and is distinct from the automatic
-//     retry Nack performs.
+//     with Attempts reset to zero and AvailableAt set to now, regardless of
+//     its current LeaseToken; it is the primitive behind Inspector.Retry and
+//     is distinct from the automatic retry Nack performs.
 type Store interface {
 	// Enqueue durably records job, ready to be leased once its AvailableAt has
 	// passed.
@@ -102,20 +111,27 @@ type Store interface {
 
 	// Lease atomically claims up to limit due jobs from queue (all queues when
 	// queue is empty) on behalf of owner, marking them StateLeased with
-	// LeaseExpiresAt set to now+leaseTTL. limit <= 0 means unlimited.
+	// LeaseExpiresAt set to now+leaseTTL and a fresh LeaseToken. limit <= 0
+	// means unlimited.
 	Lease(ctx context.Context, queue, owner string, leaseTTL time.Duration, limit int) ([]*Job, error)
 
-	// Ack marks id as successfully completed. result is the handler's response
-	// payload (already serialized), used only when id is a fan-out child; it
-	// is ignored otherwise and may be nil.
-	Ack(ctx context.Context, id string, result []byte) error
+	// Ack marks id as successfully completed, provided token matches the lease
+	// token Lease last handed out for it (otherwise ErrStaleLease; see
+	// invariant 4). result is the handler's response payload (already
+	// serialized), used only when id is a fan-out child; it is ignored
+	// otherwise and may be nil.
+	Ack(ctx context.Context, id string, token int64, result []byte) error
 
 	// Nack records a failed delivery attempt for id, described by cause, and
-	// either reschedules it for retry or dead-letters it (see invariant 5).
-	Nack(ctx context.Context, id string, cause error) error
+	// either reschedules it for retry or dead-letters it, provided token
+	// matches the lease token Lease last handed out for it (otherwise
+	// ErrStaleLease; see invariant 5).
+	Nack(ctx context.Context, id string, token int64, cause error) error
 
-	// DeadLetter forces id into StateDeadLetter, described by cause.
-	DeadLetter(ctx context.Context, id string, cause error) error
+	// DeadLetter forces id into StateDeadLetter, described by cause, provided
+	// token matches the lease token Lease last handed out for it (otherwise
+	// ErrStaleLease; see invariant 6).
+	DeadLetter(ctx context.Context, id string, token int64, cause error) error
 
 	// Get returns a snapshot of the job identified by id, or ErrJobNotFound.
 	Get(ctx context.Context, id string) (*Job, error)

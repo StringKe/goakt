@@ -46,6 +46,11 @@ type memoryStore struct {
 	children  map[string][]string // parentID -> child job ids, in order
 	remaining map[string]int      // parentID -> outstanding (non-terminal) child count
 	results   map[string][]ChildResult
+
+	// leaseTokenSeq is the source of the fencing token Lease hands out on every
+	// successful grant/reclaim; it only ever increases, so a stale token can
+	// never collide with the job's current one.
+	leaseTokenSeq int64
 }
 
 // NewMemoryStore returns the built-in in-memory Store implementation. It is
@@ -137,16 +142,18 @@ func (s *memoryStore) Lease(_ context.Context, queue, owner string, leaseTTL tim
 			continue
 		}
 
+		s.leaseTokenSeq++
 		job.State = StateLeased
 		job.LeaseOwner = owner
 		job.LeaseExpiresAt = now.Add(leaseTTL)
+		job.LeaseToken = s.leaseTokenSeq
 		job.UpdatedAt = now
 		leased = append(leased, job.Clone())
 	}
 	return leased, nil
 }
 
-func (s *memoryStore) Ack(_ context.Context, id string, result []byte) error {
+func (s *memoryStore) Ack(_ context.Context, id string, token int64, result []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -154,8 +161,8 @@ func (s *memoryStore) Ack(_ context.Context, id string, result []byte) error {
 	if !ok {
 		return ErrJobNotFound
 	}
-	if job.State == StateSucceeded {
-		return nil
+	if err := checkLeaseLocked(job, token); err != nil {
+		return err
 	}
 
 	job.State = StateSucceeded
@@ -167,7 +174,7 @@ func (s *memoryStore) Ack(_ context.Context, id string, result []byte) error {
 	return nil
 }
 
-func (s *memoryStore) Nack(_ context.Context, id string, cause error) error {
+func (s *memoryStore) Nack(_ context.Context, id string, token int64, cause error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -175,8 +182,8 @@ func (s *memoryStore) Nack(_ context.Context, id string, cause error) error {
 	if !ok {
 		return ErrJobNotFound
 	}
-	if job.State == StateSucceeded || job.State == StateDeadLetter {
-		return nil
+	if err := checkLeaseLocked(job, token); err != nil {
+		return err
 	}
 
 	job.Attempts++
@@ -199,7 +206,7 @@ func (s *memoryStore) Nack(_ context.Context, id string, cause error) error {
 	return nil
 }
 
-func (s *memoryStore) DeadLetter(_ context.Context, id string, cause error) error {
+func (s *memoryStore) DeadLetter(_ context.Context, id string, token int64, cause error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -207,8 +214,8 @@ func (s *memoryStore) DeadLetter(_ context.Context, id string, cause error) erro
 	if !ok {
 		return ErrJobNotFound
 	}
-	if job.State == StateDeadLetter {
-		return nil
+	if err := checkLeaseLocked(job, token); err != nil {
+		return err
 	}
 
 	job.State = StateDeadLetter
@@ -219,6 +226,23 @@ func (s *memoryStore) DeadLetter(_ context.Context, id string, cause error) erro
 
 	if job.ParentID != "" {
 		s.completeChildLocked(job.ParentID, job.ChildIndex, nil, true, job.LastError)
+	}
+	return nil
+}
+
+// checkLeaseLocked enforces the fencing invariant shared by Ack/Nack/
+// DeadLetter (Store invariants 4-6): a job already in a terminal state can
+// never be re-finalized regardless of token (this is what stops a late Ack
+// from resurrecting a dead-lettered job), and a non-terminal job can only be
+// finalized by whoever holds its current LeaseToken -- a stale worker whose
+// lease already expired and was reclaimed presents an old token that no
+// longer matches. Must be called with the store's mutex held.
+func checkLeaseLocked(job *Job, token int64) error {
+	if job.State == StateSucceeded || job.State == StateDeadLetter {
+		return ErrStaleLease
+	}
+	if job.LeaseToken != token {
+		return ErrStaleLease
 	}
 	return nil
 }

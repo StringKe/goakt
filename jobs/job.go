@@ -113,9 +113,17 @@ type Job struct {
 	AvailableAt    time.Time
 	LeaseExpiresAt time.Time
 	LeaseOwner     string
-	LastError      string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// LeaseToken is the fencing token Lease assigned on the most recent
+	// successful lease grant/reclaim. Ack/Nack/DeadLetter require the caller to
+	// present the token it was handed, so a worker whose lease already expired
+	// and was reclaimed by another worker cannot finalize the job out from
+	// under its new owner (see ErrStaleLease). It is not carried by
+	// ToEnvelope/FromEnvelope: a durable adapter wiring lease fencing through
+	// internalpb.JobEnvelope needs its own wire field for it.
+	LeaseToken int64
+	LastError  string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 
 	// Fan-out/fan-in linkage. ParentID and ChildIndex are set only on a
 	// fan-out child (created via EnqueueFanOut); ChildCount and ChildResults

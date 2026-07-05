@@ -146,6 +146,28 @@ func (alwaysFailActor) Receive(ctx *actor.ReceiveContext) {
 	}
 }
 
+// slowActor sleeps for delay before replying, standing in for a handler still
+// running when the engine is asked to Stop.
+type slowActor struct {
+	delay time.Duration
+}
+
+func newSlowActor(delay time.Duration) *slowActor {
+	return &slowActor{delay: delay}
+}
+
+func (a *slowActor) PreStart(*actor.Context) error { return nil }
+func (a *slowActor) PostStop(*actor.Context) error { return nil }
+func (a *slowActor) Receive(ctx *actor.ReceiveContext) {
+	switch ctx.Message().(type) {
+	case *testpb.TestSum:
+		time.Sleep(a.delay)
+		ctx.Response(&testpb.TestSumResult{Result: 1})
+	default:
+		ctx.Unhandled()
+	}
+}
+
 func newTestActorSystem(t *testing.T) actor.ActorSystem {
 	t.Helper()
 	ctx := context.Background()
@@ -305,4 +327,129 @@ func TestEngine_StartTwiceErrors(t *testing.T) {
 	require.NoError(t, engine.Start(ctx))
 	t.Cleanup(func() { _ = engine.Stop(context.Background()) })
 	require.ErrorIs(t, engine.Start(ctx), jobs.ErrEngineAlreadyStarted)
+}
+
+// TestEngine_StaleWorkerLateAckAfterLeaseReassigned proves the P0-2 fencing
+// fix: worker A leases a job and then "times out" (its lease expires without
+// an Ack/Nack). Once worker B reclaims and finishes the job, A's belated
+// Ack/Nack -- carrying its now-stale lease token -- must be rejected rather
+// than overwrite B's terminal outcome.
+func TestEngine_StaleWorkerLateAckAfterLeaseReassigned(t *testing.T) {
+	ctx := context.Background()
+	store := jobs.NewMemoryStore()
+
+	job, err := jobs.NewJob("rewards", "worker", &testpb.TestSum{A: 1, B: 1})
+	require.NoError(t, err)
+	require.NoError(t, store.Enqueue(ctx, job))
+
+	leasedA, err := store.Lease(ctx, "rewards", "worker-a", time.Millisecond, 10)
+	require.NoError(t, err)
+	require.Len(t, leasedA, 1)
+	tokenA := leasedA[0].LeaseToken
+
+	var tokenB int64
+	require.Eventually(t, func() bool {
+		leasedB, err := store.Lease(ctx, "rewards", "worker-b", time.Minute, 10)
+		if err != nil || len(leasedB) != 1 {
+			return false
+		}
+		tokenB = leasedB[0].LeaseToken
+		return true
+	}, time.Second, 5*time.Millisecond, "worker-b must reclaim the job once worker-a's lease expires")
+	require.NotEqual(t, tokenA, tokenB)
+
+	require.NoError(t, store.Ack(ctx, job.ID, tokenB, nil))
+	got, err := store.Get(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, jobs.StateSucceeded, got.State)
+
+	require.ErrorIs(t, store.Ack(ctx, job.ID, tokenA, nil), jobs.ErrStaleLease)
+	require.ErrorIs(t, store.Nack(ctx, job.ID, tokenA, errors.New("late failure")), jobs.ErrStaleLease)
+
+	got, err = store.Get(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, jobs.StateSucceeded, got.State, "worker-a's stale calls must not overwrite worker-b's terminal outcome")
+}
+
+// TestEngine_StopWithInFlightDelivery proves Stop never leaves a job stuck: a
+// Stop whose ctx expires before the in-flight handler replies still cancels
+// the engine's run context, which aborts the in-flight Ask and drives a
+// Nack, so the job ends up re-leasable (or terminal) rather than orphaned in
+// StateLeased forever.
+func TestEngine_StopWithInFlightDelivery(t *testing.T) {
+	ctx := context.Background()
+	system := newTestActorSystem(t)
+	_, err := system.Spawn(ctx, "slow", newSlowActor(150*time.Millisecond))
+	require.NoError(t, err)
+
+	store := jobs.NewMemoryStore()
+	engine, err := jobs.NewEngine(system, jobs.EngineConfig{
+		Store:        store,
+		PollInterval: 10 * time.Millisecond,
+		LeaseTTL:     time.Second,
+		AskTimeout:   time.Second,
+		Logger:       log.DiscardLogger,
+	})
+	require.NoError(t, err)
+	require.NoError(t, engine.Start(ctx))
+
+	job, err := jobs.NewJob("rewards", "slow", &testpb.TestSum{A: 1, B: 1},
+		jobs.WithRetryPolicy(jobs.FixedBackoff(10*time.Millisecond, 3)))
+	require.NoError(t, err)
+	require.NoError(t, engine.Enqueue(ctx, job))
+
+	// let the poller lease and start delivering, before the slow handler has
+	// had time to reply.
+	require.Eventually(t, func() bool {
+		got, err := store.Get(ctx, job.ID)
+		return err == nil && got.State == jobs.StateLeased
+	}, time.Second, 5*time.Millisecond)
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	_ = engine.Stop(stopCtx) // may return context.DeadlineExceeded; that is fine
+
+	require.Eventually(t, func() bool {
+		got, err := store.Get(ctx, job.ID)
+		return err == nil && got.State != jobs.StateLeased
+	}, 2*time.Second, 10*time.Millisecond, "job must reach a re-leasable or terminal state after Stop, not remain stuck leased")
+}
+
+// TestEngine_NacksOnUndecodablePayload seeds the Store directly with a job
+// whose Payload is not a valid serialized proto envelope: the engine must
+// treat the decode failure as a delivery failure (Nack), same as any other
+// transport-level error, eventually dead-lettering once retries are
+// exhausted.
+func TestEngine_NacksOnUndecodablePayload(t *testing.T) {
+	ctx := context.Background()
+	system := newTestActorSystem(t)
+	_, err := system.Spawn(ctx, "sum", &sumActor{})
+	require.NoError(t, err)
+
+	store := jobs.NewMemoryStore()
+	engine, err := jobs.NewEngine(system, jobs.EngineConfig{
+		Store:        store,
+		PollInterval: 10 * time.Millisecond,
+		LeaseTTL:     time.Second,
+		Logger:       log.DiscardLogger,
+	})
+	require.NoError(t, err)
+	require.NoError(t, engine.Start(ctx))
+	t.Cleanup(func() { _ = engine.Stop(context.Background()) })
+
+	job, err := jobs.NewJob("rewards", "sum", &testpb.TestSum{A: 1, B: 1},
+		jobs.WithRetryPolicy(jobs.FixedBackoff(10*time.Millisecond, 2)))
+	require.NoError(t, err)
+	job.Payload = []byte("not a valid serialized proto envelope")
+	require.NoError(t, store.Enqueue(ctx, job))
+
+	require.Eventually(t, func() bool {
+		got, err := store.Get(ctx, job.ID)
+		return err == nil && got.State == jobs.StateDeadLetter
+	}, 2*time.Second, 10*time.Millisecond)
+
+	got, err := store.Get(ctx, job.ID)
+	require.NoError(t, err)
+	require.Equal(t, 2, got.Attempts)
+	require.NotEmpty(t, got.LastError)
 }

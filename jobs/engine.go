@@ -305,13 +305,13 @@ func (e *Engine) deliver(ctx context.Context, job *Job) {
 		return
 	}
 
-	if ackErr := e.store.Ack(ctx, job.ID, e.encodeResult(response)); ackErr != nil {
+	if ackErr := e.store.Ack(ctx, job.ID, job.LeaseToken, e.encodeResult(response)); ackErr != nil {
 		e.logger.Error(fmt.Errorf("jobs: ack failed job=%s: %w", job.ID, ackErr))
 	}
 }
 
 func (e *Engine) nack(ctx context.Context, job *Job, cause error) {
-	if err := e.store.Nack(ctx, job.ID, cause); err != nil {
+	if err := e.store.Nack(ctx, job.ID, job.LeaseToken, cause); err != nil {
 		e.logger.Error(fmt.Errorf("jobs: nack failed job=%s: %w", job.ID, err))
 	}
 }

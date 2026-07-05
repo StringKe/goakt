@@ -13,7 +13,7 @@ This is an embedded, actor-native primitive: no extra server to run, jobs delive
 ## Core concepts
 
 - **`jobs.Job`** — a unit of durable work: target actor/grain name, serialized payload, retry policy, and lifecycle state.
-- **`jobs.Store`** — the storage-agnostic persistence contract (`Enqueue`/`Lease`/`Ack`/`Nack`/`DeadLetter`, plus a read/admin surface). `jobs.NewMemoryStore()` is the built-in default; durable adapters (SQL, ...) can be implemented outside this package.
+- **`jobs.Store`** — the storage-agnostic persistence contract (`Enqueue`/`Lease`/`Ack`/`Nack`/`DeadLetter`, plus a read/admin surface). `jobs.NewMemoryStore()` is the built-in default; durable adapters (SQL, ...) can be implemented outside this package. `Ack`/`Nack`/`DeadLetter` require the lease token `Lease` handed out for the job (`Job.LeaseToken`), so a worker whose lease already expired and was reclaimed by another worker cannot finalize the job out from under its new owner — a mismatched or already-terminal job returns `jobs.ErrStaleLease` instead.
 - **`jobs.Engine`** — binds a `Store` to an `ActorSystem`: polls for due jobs and delivers each one.
 - **`jobs.Inspector`** — a read/admin surface over a `Store` for operator tooling.
 
@@ -74,7 +74,7 @@ func (a *RewardWorker) Receive(ctx *actor.ReceiveContext) {
 - Reply with an `error` value, or never reply (the `Ask` times out), or the target cannot be resolved: the job is **Nack**'d and retried per its `RetryPolicy`, or moved to the dead-letter state once attempts are exhausted.
 
 <Warning>
-A worker that crashes mid-delivery never gets the chance to Ack or Nack. That is fine by design: its lease simply expires, and any `Engine` sharing the same `Store` (an inevitability in cluster mode, since every node runs its own `Engine`) reclaims and redelivers the job on a later poll. This is what makes delivery crash-safe by construction.
+A worker that crashes mid-delivery never gets the chance to Ack or Nack. That is fine by design: its lease simply expires, and any `Engine` sharing the same `Store` (an inevitability in cluster mode, since every node runs its own `Engine`) reclaims and redelivers the job on a later poll. This is what makes delivery crash-safe by construction. If the original worker was merely slow rather than dead and its Ack/Nack arrives after redelivery, the Store rejects it (`ErrStaleLease`): its lease token no longer matches the one handed to the worker that reclaimed the job, so it cannot overwrite that worker's outcome.
 </Warning>
 
 ## Retry policies

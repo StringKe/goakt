@@ -68,4 +68,12 @@ var (
 	// state Retry can act on (only StateDeadLetter and StatePending jobs can be
 	// force-retried).
 	ErrNotRetryable = errors.New("jobs: job is not in a retryable state")
+
+	// ErrStaleLease is returned by Ack/Nack/DeadLetter when the caller's lease
+	// token no longer matches the job's current one (the lease already expired
+	// and was reclaimed by another worker) or the job has already reached a
+	// terminal state (StateSucceeded or StateDeadLetter). It is what stops a
+	// late finalization from a stale worker from overwriting another worker's
+	// outcome or resurrecting an already-terminal job.
+	ErrStaleLease = errors.New("jobs: lease token is stale or job already terminal")
 )
