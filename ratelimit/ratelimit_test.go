@@ -362,6 +362,109 @@ func TestAllowReturnsErrLimiterBusyOnPersistentLockContention(t *testing.T) {
 	require.ErrorIs(t, err, ErrLimiterBusy)
 }
 
+// TestAllowWindowRolloverAdmitsUpToDoubleLimit documents the fixed-window
+// boundary effect called out in the package doc comment: a burst straddling
+// two windows can admit up to 2x Limit requests (limit spent at the tail of
+// the first window, plus a fresh limit at the head of the second), but never
+// more than that.
+func TestAllowWindowRolloverAdmitsUpToDoubleLimit(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	const limit = 3
+	limiter, err := New(store, limit, time.Minute)
+	require.NoError(t, err)
+
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	limiter.now = func() time.Time { return start }
+
+	// spend the entire budget at the tail of the first window
+	for i := 0; i < limit; i++ {
+		ok, err := limiter.Allow(ctx, "user-1")
+		require.NoError(t, err)
+		require.Truef(t, ok, "request %d in window 1 should be admitted", i)
+	}
+	ok, err := limiter.Allow(ctx, "user-1")
+	require.NoError(t, err)
+	require.False(t, ok, "window 1's budget is exhausted")
+
+	// roll into the next window and spend its full budget too
+	limiter.now = func() time.Time { return start.Add(time.Minute) }
+	for i := 0; i < limit; i++ {
+		ok, err := limiter.Allow(ctx, "user-1")
+		require.NoError(t, err)
+		require.Truef(t, ok, "request %d in window 2 should be admitted", i)
+	}
+
+	// the ceiling: exactly 2x limit total, never more
+	ok, err = limiter.Allow(ctx, "user-1")
+	require.NoError(t, err)
+	require.False(t, ok, "2x limit is the documented ceiling for a boundary-straddling burst")
+}
+
+// TestAllowNExactlyAtLimit verifies that n == limit is admitted in full (the
+// boundary is inclusive), and that the window's budget is then fully spent.
+func TestAllowNExactlyAtLimit(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	const limit = 5
+	limiter, err := New(store, limit, time.Minute)
+	require.NoError(t, err)
+
+	ok, err := limiter.AllowN(ctx, "user-1", limit)
+	require.NoError(t, err)
+	require.True(t, ok, "n == limit must be admitted")
+
+	ok, err = limiter.Allow(ctx, "user-1")
+	require.NoError(t, err)
+	require.False(t, ok, "the budget is now fully spent")
+
+	ok, err = limiter.AllowN(ctx, "user-1", 1)
+	require.NoError(t, err)
+	require.False(t, ok, "no budget remains for any further request")
+}
+
+// TestAllowConcurrentAcrossWindowExpiry races concurrent Allow calls against a
+// clock that flips from one window to the next mid-burst, under -race. The
+// only invariant asserted is the documented ceiling: admission across the
+// boundary must never exceed 2x the limit, no matter how the calls interleave
+// with the window rollover.
+func TestAllowConcurrentAcrossWindowExpiry(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	const limit = 20
+	limiter, err := New(store, limit, time.Minute)
+	require.NoError(t, err)
+
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var now atomic.Value
+	now.Store(start)
+	limiter.now = func() time.Time { return now.Load().(time.Time) }
+
+	const attempts = 400
+	var admitted atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(attempts)
+	for i := range attempts {
+		go func(i int) {
+			defer wg.Done()
+			// flip the clock to the next window partway through the burst so
+			// some goroutines race the rollover itself.
+			if i == attempts/2 {
+				now.Store(start.Add(time.Minute))
+			}
+			ok, err := limiter.Allow(ctx, "shared-key")
+			require.NoError(t, err)
+			if ok {
+				admitted.Add(1)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	require.LessOrEqualf(t, admitted.Load(), int64(2*limit), "a boundary-straddling burst must never admit more than 2x the limit")
+	require.Positive(t, admitted.Load(), "at least some requests should be admitted")
+}
+
 func TestAllowConcurrentStaysWithinLimit(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeStore()

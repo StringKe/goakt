@@ -99,15 +99,23 @@ func (r *relocator) Relocate(ctx *ReceiveContext) {
 		}
 
 		leaderShares, peersShares := r.allocateActors(len(peers)+1, peerState)
-		eg, egCtx := errgroup.WithContext(rctx)
+		// A plain (non-cancelling) group is deliberate: errgroup.WithContext
+		// would cancel a shared context the instant any one actor/grain fails
+		// to relocate (e.g. a journaled entry referencing an actor type that
+		// is no longer registered), aborting every sibling relocation still
+		// in flight on the same node. Placement replay is documented as
+		// best-effort per entry, so one bad entry must not starve the rest;
+		// eg.Wait() below still waits for every goroutine and surfaces the
+		// first error for reporting/abort purposes.
+		eg := new(errgroup.Group)
 		eg.SetLimit(defaultRelocationConcurrency)
 		logger := r.pid.getLogger()
 
-		r.relocateActors(egCtx, eg, leaderShares, peersShares, peers)
+		r.relocateActors(rctx, eg, leaderShares, peersShares, peers)
 
 		if len(peerState.GetGrains()) > 0 {
 			leaderGrains, peersGrains := r.allocateGrains(len(peers)+1, peerState)
-			r.relocateGrains(egCtx, eg, leaderGrains, peersGrains, peers)
+			r.relocateGrains(rctx, eg, leaderGrains, peersGrains, peers)
 		}
 
 		// only block when there are go routines running

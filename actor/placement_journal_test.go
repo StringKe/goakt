@@ -24,6 +24,7 @@ package actor
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -165,6 +166,56 @@ func TestRecordActorPlacement(t *testing.T) {
 		entries, err := journal.ListByNode(ctx, sys.PeersAddress())
 		require.NoError(t, err)
 		require.Empty(t, entries)
+	})
+}
+
+// erroringJournal is a placement.Journal whose Record always fails, used to
+// prove recording is best-effort: a journal store outage must never fail an
+// actor or grain spawn.
+type erroringJournal struct {
+	recordErr error
+}
+
+func (j *erroringJournal) Record(context.Context, *placement.Entry) error { return j.recordErr }
+func (j *erroringJournal) Delete(context.Context, string, string) error   { return nil }
+func (j *erroringJournal) ListByNode(context.Context, string) ([]*placement.Entry, error) {
+	return nil, nil
+}
+func (j *erroringJournal) DeleteByNode(context.Context, string) error { return nil }
+
+// TestRecordActorPlacement_JournalErrorDoesNotFailSpawn verifies that a
+// placement journal store failure is logged and swallowed rather than
+// propagated: putActorOnCluster/putGrainOnCluster must still succeed, since
+// the journal is a best-effort crash-recovery aid, not a spawn precondition.
+func TestRecordActorPlacement_JournalErrorDoesNotFailSpawn(t *testing.T) {
+	t.Run("Actor variant", func(t *testing.T) {
+		clusterMock := mockcluster.NewCluster(t)
+		sys := MockReplicationTestSystem(clusterMock)
+		sys.placementJournal = &erroringJournal{recordErr: errors.New("journal store unavailable")}
+
+		pid := &PID{
+			actorSystem: sys,
+			actor:       NewMockActor(),
+			address:     address.New("victim", sys.Name(), "127.0.0.1", 8080),
+		}
+		pid.setState(relocationState, true)
+
+		require.NoError(t, sys.putActorOnCluster(pid))
+	})
+
+	t.Run("Grain variant", func(t *testing.T) {
+		clusterMock := mockcluster.NewCluster(t)
+		sys := MockReplicationTestSystem(clusterMock)
+		sys.placementJournal = &erroringJournal{recordErr: errors.New("journal store unavailable")}
+
+		identity := newGrainIdentity(new(MockGrain), "grain-err")
+		gPID := &grainPID{
+			identity:    identity,
+			actorSystem: sys,
+			config:      newGrainConfig(),
+		}
+
+		require.NoError(t, sys.putGrainOnCluster(gPID))
 	})
 }
 
@@ -450,6 +501,75 @@ func TestCrashRelocationReplaysJournalForDeadNode(t *testing.T) {
 		entries, err := journal.ListByNode(ctx, deadNodeAddr)
 		return err == nil && len(entries) == 0
 	}, 30*time.Second, 200*time.Millisecond, "the dead node's journal entries should be cleared after relocation completes")
+
+	assert.NoError(t, node.Stop(ctx))
+	assert.NoError(t, sd.Close())
+	srv.Shutdown()
+}
+
+// TestCrashRelocationReplayWithUnregisteredActorType proves that a single
+// journaled actor whose type was never registered on the surviving node does
+// not prevent every other journaled entry for the same dead node from being
+// replayed: the bad entry is skipped, the good one is still respawned.
+func TestCrashRelocationReplayWithUnregisteredActorType(t *testing.T) {
+	ctx := context.Background()
+	srv := startNatsServer(t)
+
+	journal := placement.NewInMemoryJournal()
+	node, sd := testNATs(t, srv.Addr().String(), withTestPlacementJournal(journal))
+	require.NotNil(t, node)
+	require.NotNil(t, sd)
+
+	sys := node.(*actorSystem)
+
+	// this address never actually ran on this process: it stands in for a
+	// node that crashed (kill -9) before ever pushing graceful PeerState.
+	deadNodeAddr := "127.0.0.1:64998"
+
+	goodName := "phoenix"
+	wireActor := &internalpb.Actor{
+		Address:     address.New(goodName, sys.Name(), "127.0.0.1", 20000).String(),
+		Type:        types.Name(new(MockActor)),
+		Relocatable: true,
+	}
+	goodPayload, err := proto.Marshal(wireActor)
+	require.NoError(t, err)
+	require.NoError(t, journal.Record(ctx, &placement.Entry{
+		ID:      wireActor.GetAddress(),
+		Node:    deadNodeAddr,
+		Kind:    placement.KindActor,
+		Payload: goodPayload,
+	}))
+
+	ghostName := "ghost"
+	ghostActor := &internalpb.Actor{
+		Address:     address.New(ghostName, sys.Name(), "127.0.0.1", 20001).String(),
+		Type:        "no.such.actortype.exists",
+		Relocatable: true,
+	}
+	ghostPayload, err := proto.Marshal(ghostActor)
+	require.NoError(t, err)
+	require.NoError(t, journal.Record(ctx, &placement.Entry{
+		ID:      ghostActor.GetAddress(),
+		Node:    deadNodeAddr,
+		Kind:    placement.KindActor,
+		Payload: ghostPayload,
+	}))
+
+	event := &cluster.Event{
+		Type:    cluster.NodeLeft,
+		Payload: &cluster.NodeLeftEvent{Address: deadNodeAddr, Timestamp: time.Now()},
+	}
+	sys.handleNodeLeftEvent(event)
+
+	require.Eventually(t, func() bool {
+		exists, err := node.ActorExists(ctx, goodName)
+		return err == nil && exists
+	}, 30*time.Second, 200*time.Millisecond, "actor %s should be respawned despite the unregistered-type entry sharing its dead node", goodName)
+
+	exists, err := node.ActorExists(ctx, ghostName)
+	require.NoError(t, err)
+	require.False(t, exists, "the entry referencing an unregistered actor type must never be spawned")
 
 	assert.NoError(t, node.Stop(ctx))
 	assert.NoError(t, sd.Close())

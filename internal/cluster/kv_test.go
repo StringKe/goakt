@@ -170,6 +170,76 @@ func TestTryLock(t *testing.T) {
 	require.ErrorIs(t, err, ErrLockNotHeld)
 }
 
+// TestPutKVGetKVSpecialCharacterKeys pins the behavior of keys that are not
+// plain identifiers: colons (already used elsewhere as a namespacing
+// convention within a single key), unicode, and the empty string.
+func TestPutKVGetKVSpecialCharacterKeys(t *testing.T) {
+	ctx := context.Background()
+	cl := newSingleNodeKVCluster(t)
+
+	t.Run("Colons inside the key round-trip", func(t *testing.T) {
+		key := "tenant:acme:widget:7"
+		require.NoError(t, cl.PutKV(ctx, key, []byte("v1"), 0))
+		value, err := cl.GetKV(ctx, key)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("v1"), value)
+	})
+
+	t.Run("Unicode key round-trips", func(t *testing.T) {
+		key := "用户:名前:🚀"
+		require.NoError(t, cl.PutKV(ctx, key, []byte("unicode-value"), 0))
+		value, err := cl.GetKV(ctx, key)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("unicode-value"), value)
+	})
+
+	t.Run("Empty string key round-trips like any other key", func(t *testing.T) {
+		key := ""
+		require.NoError(t, cl.PutKV(ctx, key, []byte("empty-key-value"), 0))
+		value, err := cl.GetKV(ctx, key)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("empty-key-value"), value)
+
+		require.NoError(t, cl.DeleteKV(ctx, key))
+		_, err = cl.GetKV(ctx, key)
+		require.ErrorIs(t, err, ErrKVKeyNotFound)
+	})
+}
+
+// TestPutIsNotBlockedByTryLock pins the advisory-lock contract: TryLock
+// guards a caller-defined convention (composeKey(namespaceLocks, key)), a
+// namespace entirely separate from the KV data itself
+// (composeKey(namespaceKV, key)). Holding a lock for a given logical key must
+// never block a Put for that same logical key - the lock is a cooperative
+// signal between callers, not an enforcement mechanism over the KV store.
+func TestPutIsNotBlockedByTryLock(t *testing.T) {
+	ctx := context.Background()
+	cl := newSingleNodeKVCluster(t)
+
+	key := "cert:example.com"
+	lock, err := cl.TryLock(ctx, key, 5*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cl.PutKV(ctx, key, []byte("issued"), 0)
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err, "Put on a locked key must succeed instead of blocking on the lock")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Put on a locked key blocked instead of succeeding immediately")
+	}
+
+	value, err := cl.GetKV(ctx, key)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("issued"), value)
+
+	require.NoError(t, lock.Unlock(ctx))
+}
+
 func TestTryLockExpiry(t *testing.T) {
 	ctx := context.Background()
 	cl := newSingleNodeKVCluster(t)

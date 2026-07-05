@@ -207,3 +207,41 @@ func TestKV(t *testing.T) {
 		assert.ErrorIs(t, err, kv.ErrLockNotHeld)
 	})
 }
+
+// TestKV_OpsReturnClusterDisabled verifies that every mutating kv.Store
+// operation re-checks cluster availability on each call rather than caching
+// it from when the store handle was obtained: flipping clusterEnabled off
+// after acquiring the store must make Put/PutIfAbsent/Delete/TryLock all
+// return gerrors.ErrClusterDisabled (Get is covered above).
+func TestKV_OpsReturnClusterDisabled(t *testing.T) {
+	ctx := context.Background()
+	clusterMock := mockscluster.NewCluster(t)
+
+	sys, err := NewActorSystem("testSys", WithLogger(log.DiscardLogger))
+	require.NoError(t, err)
+	require.NoError(t, sys.Start(ctx))
+
+	sysImpl := sys.(*actorSystem)
+	sysImpl.cluster = clusterMock
+	sysImpl.clusterEnabled.Store(true)
+
+	store, err := sys.KV()
+	require.NoError(t, err)
+	require.NotNil(t, store)
+
+	// flip cluster mode off after the handle was already obtained
+	sysImpl.clusterEnabled.Store(false)
+
+	err = store.Put(ctx, "widget", []byte("node-1"))
+	assert.ErrorIs(t, err, gerrors.ErrClusterDisabled)
+
+	err = store.PutIfAbsent(ctx, "widget", []byte("node-1"))
+	assert.ErrorIs(t, err, gerrors.ErrClusterDisabled)
+
+	err = store.Delete(ctx, "widget")
+	assert.ErrorIs(t, err, gerrors.ErrClusterDisabled)
+
+	lock, err := store.TryLock(ctx, "cert:example.com", 5*time.Second)
+	require.Nil(t, lock)
+	assert.ErrorIs(t, err, gerrors.ErrClusterDisabled)
+}
