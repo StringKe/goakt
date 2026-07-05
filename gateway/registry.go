@@ -43,6 +43,15 @@ type connEntry struct {
 	send   func([]byte) error
 	pid    *actor.PID
 	topics map[string]struct{}
+
+	// reserved is true from the moment Register publishes this entry under the id
+	// until its backing actor has finished spawning. It lets a concurrent Unregister
+	// for the same id detect the in-flight registration instead of racing past it.
+	reserved bool
+	// dead is set by Unregister when it finds the id still reserved: it tells the
+	// in-flight Register to roll back the spawn instead of finalizing an entry the
+	// caller of Unregister already believes is gone.
+	dead bool
 }
 
 // topicBridge is the cluster-wide fan-out side of a locally joined topic: a
@@ -92,35 +101,63 @@ func NewRegistry(system actor.ActorSystem, logger log.Logger) *Registry {
 	}
 }
 
+// registerSpawnBarrier, when non-nil, is invoked with id after Register has reserved id
+// in the connection table and before it spawns the backing actor. It exists solely so
+// tests can deterministically interleave a concurrent Unregister within that window;
+// production code never sets it.
+var registerSpawnBarrier func(id string)
+
 // Register adds a new connection to the local table and makes it addressable
 // cluster-wide under connActorName(id). send is invoked (from any goroutine, including
 // remote-delivery ones) whenever a payload must be written to the underlying socket; it
 // must be non-blocking or perform its own internal buffering, since Registry never
 // queues on the caller's behalf.
 //
+// The id is reserved in the table before the backing actor is spawned, so a concurrent
+// Register for the same id fails immediately with ErrConnectionExists rather than racing
+// past the reservation. If an Unregister for id arrives while the actor is still
+// spawning, Register rolls back the spawn and returns ErrConnectionClosed instead of
+// resurrecting a connection the Unregister caller already believes is gone.
+//
 // It returns ErrConnectionExists if id is already registered.
 func (r *Registry) Register(ctx context.Context, id string, send func([]byte) error, topics ...string) error {
+	entry := &connEntry{
+		id:       id,
+		send:     send,
+		topics:   make(map[string]struct{}),
+		reserved: true,
+	}
+
 	r.mu.Lock()
 	if _, exists := r.conns[id]; exists {
 		r.mu.Unlock()
 		return ErrConnectionExists
 	}
+	r.conns[id] = entry
 	r.mu.Unlock()
 
-	pid, err := r.system.Spawn(ctx, connActorName(id), newConnActor(send), actor.WithEphemeral())
-	if err != nil {
-		return err
+	if registerSpawnBarrier != nil {
+		registerSpawnBarrier(id)
 	}
 
-	entry := &connEntry{
-		id:     id,
-		send:   send,
-		pid:    pid,
-		topics: make(map[string]struct{}),
-	}
+	pid, spawnErr := r.system.Spawn(ctx, connActorName(id), newConnActor(send), actor.WithEphemeral())
 
 	r.mu.Lock()
-	r.conns[id] = entry
+	if entry.dead || spawnErr != nil {
+		// Either the spawn failed, or a concurrent Unregister already claimed id while
+		// it was still reserved: undo the reservation instead of finalizing it.
+		delete(r.conns, id)
+		r.mu.Unlock()
+		if spawnErr != nil {
+			return spawnErr
+		}
+		if shutdownErr := pid.Shutdown(ctx); shutdownErr != nil {
+			r.logger.Warnf("gateway: failed to shut down actor for concurrently unregistered connection %q: %v", id, shutdownErr)
+		}
+		return ErrConnectionClosed
+	}
+	entry.pid = pid
+	entry.reserved = false
 	r.mu.Unlock()
 
 	for _, topic := range topics {
@@ -134,10 +171,20 @@ func (r *Registry) Register(ctx context.Context, id string, send func([]byte) er
 
 // Unregister removes a connection from the local table, leaves every topic it had
 // joined, and shuts down its backing actor. It is a no-op if id is not registered.
+//
+// If id is currently reserved by an in-flight Register (its actor is still spawning),
+// Unregister marks the reservation dead and returns immediately: the in-flight Register
+// observes this and rolls back the spawn itself, since it is the only side that can
+// safely stop the actor it just created.
 func (r *Registry) Unregister(ctx context.Context, id string) error {
 	r.mu.Lock()
 	entry, exists := r.conns[id]
 	if !exists {
+		r.mu.Unlock()
+		return nil
+	}
+	if entry.reserved {
+		entry.dead = true
 		r.mu.Unlock()
 		return nil
 	}

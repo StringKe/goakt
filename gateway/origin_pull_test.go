@@ -72,6 +72,14 @@ func TestAuthenticatedOriginPullsVerify(t *testing.T) {
 		bad := &gateway.AuthenticatedOriginPulls{CAPEM: []byte("not a cert")}
 		require.Error(t, bad.Apply(&tls.Config{}))
 	})
+
+	t.Run("rejects a certificate that chains to the CA but has already expired", func(t *testing.T) {
+		expiredCertPEM, _ := ca.issueExpiredClientCert("expired-edge")
+		expiredBlock := parsePEMCert(t, expiredCertPEM)
+		state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{expiredBlock}}
+		err := pulls.Verify(state)
+		require.ErrorIs(t, err, gateway.ErrOriginPullVerificationFailed)
+	})
 }
 
 func parsePEMCert(t *testing.T, certPEM []byte) *x509.Certificate {

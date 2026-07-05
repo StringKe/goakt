@@ -24,6 +24,7 @@ package gateway_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -40,7 +41,10 @@ func newTestSystem(t *testing.T, opts ...actor.Option) actor.ActorSystem {
 	t.Helper()
 	ctx := context.Background()
 	allOpts := append([]actor.Option{actor.WithLogger(log.DiscardLogger)}, opts...)
-	system, err := actor.NewActorSystem(t.Name(), allOpts...)
+	// t.Name() contains '/' for subtests, which ActorSystem names reject; sanitize it so
+	// this helper works from t.Run subtests too.
+	name := strings.ReplaceAll(t.Name(), "/", "-")
+	system, err := actor.NewActorSystem(name, allOpts...)
 	require.NoError(t, err)
 	require.NoError(t, system.Start(ctx))
 	t.Cleanup(func() {
@@ -166,4 +170,58 @@ func TestRegistryJoinUnknownConnection(t *testing.T) {
 
 	err := registry.Join(context.Background(), "ghost", "topic")
 	require.ErrorIs(t, err, gateway.ErrConnectionNotFound)
+}
+
+// TestRegistrySendToConnection_Backpressure mirrors the bounded-outbound-channel pattern
+// the WS/SSE handlers use for their send closures: with a buffer of 1 and nothing
+// draining it, a second send must report ErrBackpressure instead of blocking forever.
+func TestRegistrySendToConnection_Backpressure(t *testing.T) {
+	system := newTestSystem(t)
+	registry := gateway.NewRegistry(system, log.DiscardLogger)
+	ctx := context.Background()
+
+	outbound := make(chan []byte, 1)
+	send := func(payload []byte) error {
+		select {
+		case outbound <- payload:
+			return nil
+		default:
+			return gateway.ErrBackpressure
+		}
+	}
+
+	require.NoError(t, registry.Register(ctx, "backpressured", send))
+
+	require.NoError(t, registry.SendToConnection(ctx, "backpressured", []byte("first")))
+	err := registry.SendToConnection(ctx, "backpressured", []byte("second"))
+	require.ErrorIs(t, err, gateway.ErrBackpressure)
+}
+
+// TestRegistrySendToConnectionClosedPropagatesError verifies that SendToConnection
+// forwards whatever error a locally registered connection's own send function reports -
+// in particular ErrConnectionClosed, the error the WS/SSE handlers' send closures return
+// once their socket has already torn down but before Unregister has run.
+func TestRegistrySendToConnectionClosedPropagatesError(t *testing.T) {
+	system := newTestSystem(t)
+	registry := gateway.NewRegistry(system, log.DiscardLogger)
+	ctx := context.Background()
+
+	send := func([]byte) error { return gateway.ErrConnectionClosed }
+	require.NoError(t, registry.Register(ctx, "closed-right-after", send))
+
+	err := registry.SendToConnection(ctx, "closed-right-after", []byte("hello"))
+	require.ErrorIs(t, err, gateway.ErrConnectionClosed)
+}
+
+// TestRegistryBroadcastZeroMembers verifies that Broadcast on a topic nobody has joined
+// is a no-op: no panic from ranging over the topic's (absent) membership set, and no
+// delivery attempted anywhere.
+func TestRegistryBroadcastZeroMembers(t *testing.T) {
+	system := newTestSystem(t)
+	registry := gateway.NewRegistry(system, log.DiscardLogger)
+
+	require.NotPanics(t, func() {
+		err := registry.Broadcast(context.Background(), "nobody-home", []byte("hello"))
+		require.NoError(t, err)
+	})
 }

@@ -51,9 +51,12 @@ const (
 	certKVKeyPrefix   = "gateway:cert:"
 	certLockKeyPrefix = "gateway:cert-lock:"
 
-	defaultRenewBefore    = 30 * 24 * time.Hour
-	defaultLockTTL        = 2 * time.Minute
-	defaultRenewInterval  = "@every 1h"
+	defaultRenewBefore = 30 * 24 * time.Hour
+	defaultLockTTL     = 2 * time.Minute
+	// go-quartz cron syntax (6 fields, seconds first): fire at the top of every hour.
+	// Descriptor forms like "@every 1h" are NOT supported by go-quartz and fail to
+	// parse, which would abort Manager.Start.
+	defaultRenewInterval  = "0 0 * * * *"
 	defaultWaitPollPeriod = 100 * time.Millisecond
 )
 
@@ -135,10 +138,11 @@ func WithIssuanceLockTTL(d time.Duration) ManagerOption {
 	return func(m *Manager) { m.lockTTL = d }
 }
 
-// WithRenewInterval sets the cron expression the renewal schedule uses to check for
-// expiring certificates. Defaults to "@every 1h". Pass an empty string to disable
-// automatic renewal entirely (EnsureCertificate/GetCertificate will still re-issue
-// on-demand once a served certificate has actually expired).
+// WithRenewInterval sets the cron expression (go-quartz syntax, 6 fields with seconds
+// first) the renewal schedule uses to check for expiring certificates. Defaults to
+// hourly ("0 0 * * * *"). Pass an empty string to disable automatic renewal entirely
+// (EnsureCertificate/GetCertificate will still re-issue on-demand once a served
+// certificate has actually expired).
 func WithRenewInterval(cronExpression string) ManagerOption {
 	return func(m *Manager) { m.renewInterval = cronExpression }
 }

@@ -42,6 +42,15 @@ type Server struct {
 	httpServer *http.Server
 	manager    *Manager
 	originPull *AuthenticatedOriginPulls
+	drainers   []Drainer
+}
+
+// Drainer is implemented by connection handlers (WSHandler, SSEHandler) that hold
+// long-lived connections http.Server.Shutdown cannot evict on its own: Shutdown ignores
+// hijacked WebSocket sockets entirely and would wait on open SSE streams until its
+// context expired.
+type Drainer interface {
+	Drain()
 }
 
 // ServerOption configures a Server created with NewServer.
@@ -58,6 +67,14 @@ func WithTLSManager(manager *Manager) ServerOption {
 // does not present a valid client certificate. Requires WithTLSManager.
 func WithAuthenticatedOriginPulls(pulls *AuthenticatedOriginPulls) ServerOption {
 	return func(s *Server) { s.originPull = pulls }
+}
+
+// WithDrainOnShutdown registers connection handlers whose Drain method Server.Shutdown
+// invokes before shutting the HTTP listener down, so long-lived WebSocket/SSE
+// connections are evicted promptly and clients reconnect to surviving replicas during
+// rolling deploys.
+func WithDrainOnShutdown(drainers ...Drainer) ServerOption {
+	return func(s *Server) { s.drainers = append(s.drainers, drainers...) }
 }
 
 // WithReadHeaderTimeout sets the underlying http.Server's ReadHeaderTimeout.
@@ -111,9 +128,14 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	return s.httpServer.ListenAndServe()
 }
 
-// Shutdown gracefully stops the server and, if configured, the Manager's renewal
-// schedule.
+// Shutdown gracefully stops the server: it first drains handlers registered via
+// WithDrainOnShutdown (evicting long-lived WebSocket/SSE connections that
+// http.Server.Shutdown cannot terminate itself), then stops the Manager's renewal
+// schedule if any, and finally shuts the HTTP listener down.
 func (s *Server) Shutdown(ctx context.Context) error {
+	for _, d := range s.drainers {
+		d.Drain()
+	}
 	if s.manager != nil {
 		_ = s.manager.Stop(ctx)
 	}

@@ -27,6 +27,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,59 +37,62 @@ import (
 )
 
 // SSEHandlerOption configures an http.Handler created with NewSSEHandler.
-type SSEHandlerOption func(*sseHandler)
+type SSEHandlerOption func(*SSEHandler)
 
 // WithSSEIDFunc sets the function used to derive a connection's id from the request.
 // Without one, a random UUID is generated per connection.
 func WithSSEIDFunc(f func(*http.Request) string) SSEHandlerOption {
-	return func(h *sseHandler) { h.idFunc = f }
+	return func(h *SSEHandler) { h.idFunc = f }
 }
 
 // WithSSEAuthFunc sets the auth hook run before a connection is accepted and
 // registered. A non-nil error rejects the request with HTTP 403 Forbidden.
 func WithSSEAuthFunc(f func(*http.Request) error) SSEHandlerOption {
-	return func(h *sseHandler) { h.authFunc = f }
+	return func(h *SSEHandler) { h.authFunc = f }
 }
 
 // WithSSETopics sets the function used to derive the topics a connection should be
 // joined to at registration time.
 func WithSSETopics(f func(*http.Request) []string) SSEHandlerOption {
-	return func(h *sseHandler) { h.topicsFunc = f }
+	return func(h *SSEHandler) { h.topicsFunc = f }
 }
 
 // WithSSEOnConnect sets the callback invoked once a connection has been registered and
 // the response stream has been opened.
 func WithSSEOnConnect(f func(ctx context.Context, id string, r *http.Request)) SSEHandlerOption {
-	return func(h *sseHandler) { h.onConnect = f }
+	return func(h *SSEHandler) { h.onConnect = f }
 }
 
 // WithSSEOnDisconnect sets the callback invoked once a connection has been unregistered.
 func WithSSEOnDisconnect(f func(id string)) SSEHandlerOption {
-	return func(h *sseHandler) { h.onDisconnect = f }
+	return func(h *SSEHandler) { h.onDisconnect = f }
 }
 
 // WithSSESendBuffer sets the size of each connection's outbound buffer. When full,
 // Registry.SendToConnection/Broadcast deliveries to that connection return
 // ErrBackpressure instead of blocking. Defaults to 256.
 func WithSSESendBuffer(size int) SSEHandlerOption {
-	return func(h *sseHandler) { h.bufferSize = size }
+	return func(h *SSEHandler) { h.bufferSize = size }
 }
 
 // WithSSEKeepAlive sets the interval at which a comment-only keepalive event is sent to
 // detect dead connections and prevent idle-timing-out intermediate proxies. Defaults to
 // 15 seconds.
 func WithSSEKeepAlive(d time.Duration) SSEHandlerOption {
-	return func(h *sseHandler) { h.keepAlive = d }
+	return func(h *SSEHandler) { h.keepAlive = d }
 }
 
 // WithSSELogger sets the logger used to report connection-handling errors. Defaults to
 // log.DiscardLogger.
 func WithSSELogger(logger log.Logger) SSEHandlerOption {
-	return func(h *sseHandler) { h.logger = logger }
+	return func(h *SSEHandler) { h.logger = logger }
 }
 
-// sseHandler is the http.Handler backing NewSSEHandler.
-type sseHandler struct {
+// SSEHandler opens a Server-Sent Events stream for every incoming request and registers
+// each one in its Registry for the lifetime of the connection. SSE is one-way (server to
+// client); inbound application data, if any, belongs in an ordinary HTTP endpoint the
+// client posts to separately.
+type SSEHandler struct {
 	registry     *Registry
 	idFunc       func(*http.Request) string
 	authFunc     func(*http.Request) error
@@ -98,21 +102,27 @@ type sseHandler struct {
 	bufferSize   int
 	keepAlive    time.Duration
 	logger       log.Logger
+
+	// shutdown unblocks every streaming loop on Drain. SSE handlers are ordinary
+	// (non-hijacked) requests, so without this http.Server.Shutdown would wait on them
+	// until its context expired.
+	shutdown  chan struct{}
+	drainOnce sync.Once
 }
 
 // enforce compilation error
-var _ http.Handler = (*sseHandler)(nil)
+var _ http.Handler = (*SSEHandler)(nil)
 
-// NewSSEHandler returns an http.Handler that opens a Server-Sent Events stream for
-// every incoming request and registers each one in registry for the lifetime of the
-// connection. SSE is one-way (server to client); inbound application data, if any,
-// belongs in an ordinary HTTP endpoint the client posts to separately.
-func NewSSEHandler(registry *Registry, opts ...SSEHandlerOption) http.Handler {
-	h := &sseHandler{
+// NewSSEHandler returns an SSEHandler bound to registry. The returned handler is an
+// http.Handler; wire its Drain method into Server via WithDrainOnShutdown (or call it
+// from your own shutdown path) so open streams terminate promptly on shutdown.
+func NewSSEHandler(registry *Registry, opts ...SSEHandlerOption) *SSEHandler {
+	h := &SSEHandler{
 		registry:   registry,
 		bufferSize: 256,
 		keepAlive:  15 * time.Second,
 		logger:     log.DiscardLogger,
+		shutdown:   make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -120,8 +130,22 @@ func NewSSEHandler(registry *Registry, opts ...SSEHandlerOption) http.Handler {
 	return h
 }
 
+// Drain terminates every open SSE stream and makes new requests fail fast with 503, so
+// a graceful server shutdown is not held hostage by long-lived streams. Safe to call
+// more than once.
+func (h *SSEHandler) Drain() {
+	h.drainOnce.Do(func() { close(h.shutdown) })
+}
+
 // ServeHTTP implements http.Handler.
-func (h *sseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *SSEHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	select {
+	case <-h.shutdown:
+		http.Error(w, "shutting down", http.StatusServiceUnavailable)
+		return
+	default:
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -195,6 +219,8 @@ func (h *sseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-h.shutdown:
 			return
 		case <-ticker.C:
 			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {

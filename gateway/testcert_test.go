@@ -110,6 +110,18 @@ func newTestCA() *testCA {
 // issueClientCert mints a client-auth certificate signed by ca, PEM-encoded along with
 // its private key.
 func (ca *testCA) issueClientCert(commonName string) (certPEM, keyPEM []byte) {
+	return ca.issueClientCertWithValidity(commonName, time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+}
+
+// issueExpiredClientCert mints a client-auth certificate signed by ca whose validity
+// window already elapsed, for exercising expired-certificate rejection.
+func (ca *testCA) issueExpiredClientCert(commonName string) (certPEM, keyPEM []byte) {
+	return ca.issueClientCertWithValidity(commonName, time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour))
+}
+
+// issueClientCertWithValidity mints a client-auth certificate signed by ca with an
+// explicit validity window, PEM-encoded along with its private key.
+func (ca *testCA) issueClientCertWithValidity(commonName string, notBefore, notAfter time.Time) (certPEM, keyPEM []byte) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		panic(err)
@@ -118,8 +130,8 @@ func (ca *testCA) issueClientCert(commonName string) (certPEM, keyPEM []byte) {
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
 		Subject:      pkix.Name{CommonName: commonName},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}

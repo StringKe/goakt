@@ -146,3 +146,69 @@ func TestManagerIssuanceSingleFlight(t *testing.T) {
 	}
 	require.Equal(t, int64(1), issuer.calls.Load(), "exactly one issuance call for a concurrent cold start on one node")
 }
+
+// TestManagerStartTriggersRenewal verifies the renewal schedule Start registers actually
+// fires and calls back into the issuer: with a certificate whose lifetime is shorter than
+// renewBefore, the very first cron tick after issuance must observe it as due for renewal.
+//
+// The cron expression uses go-quartz's field syntax directly ("*/1 * * * * *": every
+// second) rather than the "@every" shorthand some cron libraries support - go-quartz (used
+// by actor.ActorSystem.ScheduleWithCron) does not implement that shorthand, so this is also
+// the first test to actually exercise Manager.Start/renewAll rather than disabling renewal
+// via WithRenewInterval("").
+func TestManagerStartTriggersRenewal(t *testing.T) {
+	system := newTestSystem(t)
+	issuer := &fakeIssuer{ttl: 300 * time.Millisecond}
+	manager := gateway.NewManager(system, log.DiscardLogger,
+		gateway.WithCertIssuer(issuer),
+		gateway.WithRenewBefore(2*time.Second),
+		gateway.WithRenewInterval("*/1 * * * * *"),
+	)
+
+	ctx := context.Background()
+	require.NoError(t, manager.Start(ctx))
+	t.Cleanup(func() { _ = manager.Stop(context.Background()) })
+
+	_, err := manager.EnsureCertificate(ctx, "renews.example.com")
+	require.NoError(t, err)
+	require.EqualValues(t, 1, issuer.calls.Load())
+
+	require.Eventually(t, func() bool {
+		return issuer.calls.Load() >= 2
+	}, 5*time.Second, 50*time.Millisecond,
+		"the renewal schedule's cron tick must call the issuer again once the cached certificate is within renewBefore of expiry")
+}
+
+// TestManagerFromStore_InvalidPEMFallsBackToIssue verifies that a certificate already
+// present in the CertStore but corrupted (invalid PEM/key material) is not fatal: Manager
+// must log and fall back to a fresh issuance rather than panicking or returning the broken
+// certificate.
+func TestManagerFromStore_InvalidPEMFallsBackToIssue(t *testing.T) {
+	system := newTestSystem(t)
+	store := gateway.NewMemoryCertStore()
+	require.NoError(t, store.Put(context.Background(), &gateway.Certificate{
+		Domain:  "corrupt.example.com",
+		CertPEM: []byte("not a valid certificate"),
+		KeyPEM:  []byte("not a valid key"),
+		// Far from expiry so the fromStore expiry check passes and control actually
+		// reaches parseCertificate - the branch under test.
+		NotAfter: time.Now().Add(365 * 24 * time.Hour),
+	}))
+
+	issuer := &fakeIssuer{ttl: time.Hour}
+	manager := gateway.NewManager(system, log.DiscardLogger,
+		gateway.WithCertIssuer(issuer),
+		gateway.WithCertStore(store),
+		gateway.WithRenewBefore(time.Hour),
+		gateway.WithRenewInterval(""),
+	)
+
+	var cert *tls.Certificate
+	var err error
+	require.NotPanics(t, func() {
+		cert, err = manager.EnsureCertificate(context.Background(), "corrupt.example.com")
+	})
+	require.NoError(t, err)
+	require.NotNil(t, cert)
+	require.EqualValues(t, 1, issuer.calls.Load(), "the corrupt stored certificate must be discarded and re-issued, exactly once")
+}

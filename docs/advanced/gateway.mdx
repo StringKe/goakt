@@ -200,6 +200,33 @@ Using `Server` is entirely optional — any application already managing its own
 `*http.Server` can instead set `TLSConfig: manager.TLSConfig()` directly and mount
 `NewWSHandler`/`NewSSEHandler` like any other route.
 
+### Graceful shutdown and connection draining
+
+`http.Server.Shutdown` cannot evict long-lived connections on its own: hijacked
+WebSocket sockets are ignored entirely, and open SSE streams are waited on until the
+shutdown context expires. Register your handlers with `WithDrainOnShutdown` so
+`Server.Shutdown` closes them first — established sockets terminate, clients reconnect
+to surviving replicas, and the HTTP listener then shuts down cleanly:
+
+```go
+wsHandler := gateway.NewWSHandler(registry)
+sseHandler := gateway.NewSSEHandler(registry)
+
+server, err := gateway.NewServer(":8443", mux,
+    gateway.WithTLSManager(manager),
+    gateway.WithDrainOnShutdown(wsHandler, sseHandler),
+)
+```
+
+<Note>
+During rolling deploys this is what turns "old pods hold connections until killed" into
+an orderly hand-off: `Drain` closes every socket, the per-connection actors unregister,
+and reconnecting clients land on the replicas that stay up.
+</Note>
+
+If you manage your own `*http.Server`, call each handler's `Drain()` method from your
+shutdown path before `http.Server.Shutdown`.
+
 ## See also
 
 - [Ephemeral Actors](/actor/ephemeral-actors) — the `WithEphemeral` spawn option backing every registered connection

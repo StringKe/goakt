@@ -93,6 +93,96 @@ func TestSSEHandlerAuthRejected(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, resp.StatusCode)
 }
 
+// TestSSEHandlerDrainTerminatesStream verifies Drain unblocks open streams promptly (so
+// a graceful shutdown is not held hostage by long-lived SSE requests) and that new
+// requests after Drain fail fast with 503.
+func TestSSEHandlerDrainTerminatesStream(t *testing.T) {
+	system := newTestSystem(t)
+	registry := gateway.NewRegistry(system, log.DiscardLogger)
+
+	handler := gateway.NewSSEHandler(registry,
+		gateway.WithSSEIDFunc(func(r *http.Request) string { return r.URL.Query().Get("id") }),
+		gateway.WithSSEKeepAlive(time.Hour),
+	)
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/?id=sse-drain-1")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	pause.For(200 * time.Millisecond)
+	require.True(t, registry.Has("sse-drain-1"))
+
+	handler.Drain()
+
+	// the streaming loop returns, the server ends the chunked response, and the
+	// client's blocked read observes EOF instead of waiting on keepalives.
+	readErrCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			if _, readErr := resp.Body.Read(buf); readErr != nil {
+				readErrCh <- readErr
+				return
+			}
+		}
+	}()
+	select {
+	case readErr := <-readErrCh:
+		require.Error(t, readErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("stream was not terminated by Drain")
+	}
+
+	require.Eventually(t, func() bool {
+		return !registry.Has("sse-drain-1")
+	}, 3*time.Second, 50*time.Millisecond)
+
+	// new streams are refused while draining.
+	resp2, err := http.Get(server.URL + "/?id=sse-drain-2")
+	require.NoError(t, err)
+	defer func() { _ = resp2.Body.Close() }()
+	require.Equal(t, http.StatusServiceUnavailable, resp2.StatusCode)
+}
+
+// TestSSEHandlerDisconnectOnBodyClose verifies that a client abandoning the response
+// stream (resp.Body.Close(), without the request context ever being explicitly canceled)
+// is observed through r.Context().Done() same as an explicit cancellation, triggering the
+// registry Unregister/onDisconnect cleanup path.
+func TestSSEHandlerDisconnectOnBodyClose(t *testing.T) {
+	system := newTestSystem(t)
+	registry := gateway.NewRegistry(system, log.DiscardLogger)
+
+	disconnected := make(chan string, 1)
+	handler := gateway.NewSSEHandler(registry,
+		gateway.WithSSEIDFunc(func(r *http.Request) string { return r.URL.Query().Get("id") }),
+		gateway.WithSSEOnDisconnect(func(id string) { disconnected <- id }),
+		gateway.WithSSEKeepAlive(time.Hour),
+	)
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/?id=sse-close")
+	require.NoError(t, err)
+
+	pause.For(200 * time.Millisecond)
+	require.True(t, registry.Has("sse-close"))
+
+	require.NoError(t, resp.Body.Close())
+
+	select {
+	case id := <-disconnected:
+		require.Equal(t, "sse-close", id)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for disconnect callback after client body close")
+	}
+	require.False(t, registry.Has("sse-close"))
+}
+
 // readSSEDataLine reads lines until it finds one prefixed with "data: ", and returns its
 // content.
 func readSSEDataLine(reader *bufio.Reader) (string, error) {
