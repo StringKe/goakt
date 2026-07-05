@@ -168,21 +168,9 @@ func (x *scheduler) rebuildScheduledKeys() {
 
 // scheduleMetaFromEnvelope rebuilds the introspection metadata for a schedule restored
 // from a persistent JobQueue. The envelope only carries the target's name (resolution
-// happens by name at fire time), so Address is that name rather than a full path.
+// happens by name at fire time), so Path is that name rather than a full path.
 func scheduleMetaFromEnvelope(envelope *internalpb.ScheduledMessage) *scheduleMeta {
-	meta := &scheduleMeta{address: envelope.GetTargetName()}
-	switch trigger := envelope.GetTrigger().GetKind().(type) {
-	case *internalpb.ScheduleTrigger_Once:
-		meta.kind = TriggerKindOnce
-		meta.interval = trigger.Once.GetDelay().AsDuration()
-	case *internalpb.ScheduleTrigger_Interval:
-		meta.kind = TriggerKindInterval
-		meta.interval = trigger.Interval.GetInterval().AsDuration()
-	case *internalpb.ScheduleTrigger_Cron:
-		meta.kind = TriggerKindCron
-		meta.expression = trigger.Cron.GetExpression()
-	}
-	return meta
+	return &scheduleMeta{path: envelope.GetTargetName()}
 }
 
 // Stop stops the scheduler
@@ -246,7 +234,7 @@ func (x *scheduler) ScheduleOnce(message any, to *PID, delay time.Duration, opts
 	senderConfig := newScheduleConfig(opts...)
 	reference := senderConfig.Reference()
 	jobKey := quartz.NewJobKey(reference)
-	x.recordSchedule(reference, &scheduleMeta{kind: TriggerKindOnce, interval: delay, address: to.Path().String()})
+	x.recordSchedule(reference, &scheduleMeta{path: to.Path().String()})
 
 	triggerSpec := &internalpb.ScheduleTrigger{
 		Kind: &internalpb.ScheduleTrigger_Once{Once: &internalpb.OnceTrigger{Delay: durationpb.New(delay)}},
@@ -294,7 +282,7 @@ func (x *scheduler) Schedule(message any, to *PID, interval time.Duration, opts 
 	senderConfig := newScheduleConfig(opts...)
 	reference := senderConfig.Reference()
 	jobKey := quartz.NewJobKey(reference)
-	x.recordSchedule(reference, &scheduleMeta{kind: TriggerKindInterval, interval: interval, address: to.Path().String()})
+	x.recordSchedule(reference, &scheduleMeta{path: to.Path().String()})
 
 	triggerSpec := &internalpb.ScheduleTrigger{
 		Kind: &internalpb.ScheduleTrigger_Interval{Interval: &internalpb.IntervalTrigger{Interval: durationpb.New(interval)}},
@@ -367,7 +355,7 @@ func (x *scheduler) ScheduleWithCron(message any, to *PID, cronExpression string
 
 	reference := senderConfig.Reference()
 	jobKey := quartz.NewJobKey(reference)
-	x.recordSchedule(reference, &scheduleMeta{kind: TriggerKindCron, expression: cronExpression, address: to.Path().String()})
+	x.recordSchedule(reference, &scheduleMeta{path: to.Path().String()})
 
 	triggerSpec := &internalpb.ScheduleTrigger{
 		Kind: &internalpb.ScheduleTrigger_Cron{Cron: &internalpb.CronTrigger{Expression: cronExpression, Timezone: location.String()}},

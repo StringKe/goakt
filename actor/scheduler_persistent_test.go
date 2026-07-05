@@ -300,20 +300,12 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 		}
 
 		require.Contains(t, byRef, "intro-once")
-		assert.Equal(t, TriggerKindOnce, byRef["intro-once"].TriggerKind)
-		assert.Equal(t, time.Hour, byRef["intro-once"].Interval)
-
 		require.Contains(t, byRef, "intro-interval")
-		assert.Equal(t, TriggerKindInterval, byRef["intro-interval"].TriggerKind)
-		assert.Equal(t, time.Hour, byRef["intro-interval"].Interval)
-
 		require.Contains(t, byRef, "intro-cron")
-		assert.Equal(t, TriggerKindCron, byRef["intro-cron"].TriggerKind)
-		assert.Equal(t, "0 0 * * * *", byRef["intro-cron"].Expression)
 
-		// the envelope only carries the target's name, so that is what Address reports
+		// the envelope only carries the target's name, so that is what Path reports
 		// for a rebuilt schedule.
-		assert.Equal(t, pid.Name(), byRef["intro-once"].Address)
+		assert.Equal(t, pid.Name(), byRef["intro-once"].Path)
 	})
 
 	t.Run("cron envelopes outside cluster mode do not carry the single-fire flag", func(t *testing.T) {
