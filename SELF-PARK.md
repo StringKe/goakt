@@ -10,13 +10,13 @@ Upstream sync policy: `upstream/main` is merged in (never rebased). Feature bran
 | --- | --- | --- |
 | Persistent scheduler queue (schedules survive restarts) | `actor.WithSchedulerJobQueue(queue, locker)` | docs/actor/scheduling.mdx ("Persistent Scheduling") |
 | Cluster single-fire cron (one node fires per tick) | intrinsic: `ScheduleWithCron` in cluster mode always arbitrates; explicit `WithReference` required (`ErrScheduleReferenceRequired`) | docs/actor/scheduling.mdx |
-| Scheduler introspection | `ActorSystem.ListSchedules()` | docs/actor/scheduling.mdx |
+| Scheduler introspection | `ActorSystem.ListSchedules()` -> `ScheduleInfo{Reference, Path}` (narrowed per upstream review) | docs/actor/scheduling.mdx |
 | Cluster KV + distributed lock | `ActorSystem.KV()` -> `kv.Store` (Get/Put/PutIfAbsent/TTL/TryLock) | docs/clustering/kv-store.mdx |
 | Leader status + change events | `ActorSystem.IsLeader(ctx)`, `LeaderChanged` eventstream event | docs/clustering/clustered.mdx |
 | Cluster-wide rate limiting | `ratelimit.New(store, limit, window)` | docs/clustering/rate-limiting.mdx |
 | Crash relocation (kill -9 recovery via placement journal) | `actor.WithPlacementJournal(store)` | docs/actor/crash-relocation.mdx |
 | Non-actor pub/sub subscriptions | `ActorSystem.SubscribeTopic(topic, handler)` | docs/advanced/pubsub-bridge.mdx |
-| Topic presence / introspection | `TopicSubscriberCount` / `TopicSubscribers` / `Topics` | docs/advanced/pubsub.mdx ("Presence and introspection") |
+| Topic statistics | `ActorSystem.TopicStats(ctx, topic, timeout)` -> local subscriber count + cluster instance count (reworked to the upstream maintainer's design; subscriber identities are not exposed) | docs/advanced/pubsub.mdx ("Topic statistics") |
 | Ephemeral high-churn actors | pattern: `WithRelocationDisabled()` + `WithPassivationStrategy(passivation.NewLongLivedStrategy())` (upstream already had both; our sugar option was removed after upstream review) | docs/actor/ephemeral-actors.mdx |
 | Durable jobs: at-least-once, retry/DLQ, fan-out/fan-in, inspector | package `jobs` (`jobs.NewEngine`) | docs/advanced/jobs.mdx |
 | Gateway: cluster-shared TLS (Cloudflare Origin CA), WS/SSE connection registry, two-tier delivery, shutdown draining | package `gateway` (`gateway.NewServer`, `gateway.NewRegistry`) | docs/advanced/gateway.mdx |
@@ -29,7 +29,7 @@ The module path is unchanged (`github.com/tochemey/goakt/v4`), so consumption go
 
 ```bash
 go mod edit -require=github.com/tochemey/goakt/v4@v4.2.13
-go mod edit -replace=github.com/tochemey/goakt/v4=github.com/StringKe/goakt/v4@v4.3.0-sp.4
+go mod edit -replace=github.com/tochemey/goakt/v4=github.com/StringKe/goakt/v4@v4.3.0-sp.5
 go mod tidy
 ```
 
