@@ -1,15 +1,8 @@
 # self-park: full-capability GoAkt fork branch
 
-This branch is `github.com/StringKe/goakt` fork's long-lived integration branch: upstream
-GoAkt (`github.com/Tochemey/goakt`, currently v4.2.13+) plus twelve capabilities this
-team needs for single-app / multi-replica deployments. Everything here is implemented
-additively (new options, new packages, zero changed upstream signatures, zero new
-dependencies) and is intended to be offered upstream; until merged there, self-park is
-the source of truth.
+This branch is `github.com/StringKe/goakt` fork's long-lived integration branch: upstream GoAkt (`github.com/Tochemey/goakt`, currently v4.2.13+) plus twelve capabilities this team needs for single-app / multi-replica deployments. Everything here is implemented additively (new options, new packages, zero changed upstream signatures, zero new dependencies) and is intended to be offered upstream; until merged there, self-park is the source of truth.
 
-Upstream sync policy: `upstream/main` is merged in (never rebased). Feature branches
-`feat/01`..`feat/12` hold the upstream-clean cut of each capability for future PRs; note
-that post-integration fixes live on self-park only until cherry-picked back.
+Upstream sync policy: `upstream/main` is merged in (never rebased). Feature branches `feat/01`..`feat/12` hold the upstream-clean cut of each capability for future PRs; note that post-integration fixes live on self-park only until cherry-picked back.
 
 ## Capability index
 
@@ -32,9 +25,7 @@ Runnable samples: `playground/jobs-demo/`, `playground/gateway-echo/`.
 
 ## Consuming this branch from another Go project
 
-The module path is unchanged (`github.com/tochemey/goakt/v4`), so consumption goes
-through a `replace` directive in the application's go.mod (applies to main modules,
-which is exactly the app-side use case):
+The module path is unchanged (`github.com/tochemey/goakt/v4`), so consumption goes through a `replace` directive in the application's go.mod (applies to main modules, which is exactly the app-side use case):
 
 ```bash
 go mod edit -require=github.com/tochemey/goakt/v4@v4.2.13
@@ -42,32 +33,18 @@ go mod edit -replace=github.com/tochemey/goakt/v4=github.com/StringKe/goakt/v4@v
 go mod tidy
 ```
 
-Version convention: tags `v4.3.0-sp.N` on this fork mark verified snapshots of
-self-park (upstream base + all capabilities, full lint + race suite green). Prefer a tag
-over `@self-park` so builds stay reproducible; bump to the next `-sp.N` after each
-verified integration round. If the fork is private to your org, also set
-`GOPRIVATE=github.com/StringKe/*`.
+Version convention: tags `v4.3.0-sp.N` on this fork mark verified snapshots of self-park (upstream base + all capabilities, full lint + race suite green). Prefer a tag over `@self-park` so builds stay reproducible; bump to the next `-sp.N` after each verified integration round. If the fork is private to your org, also set `GOPRIVATE=github.com/StringKe/*`.
 
 ## Where to find context (humans and AI assistants)
 
 1. This file - capability inventory and entry points.
-2. `docs/*.mdx` pages listed above - semantics, guarantees, and worked examples per
-   capability (Mintlify sources; readable as plain markdown, or `mint dev` to browse).
-3. Package godoc - every exported type/option documents its contract; start at
-   `go doc github.com/tochemey/goakt/v4/jobs` and `go doc github.com/tochemey/goakt/v4/gateway`.
-4. `playground/jobs-demo` and `playground/gateway-echo` - minimal, runnable end-to-end
-   wiring.
-5. Tests as specification: `actor/scheduler_persistent_test.go`, `jobs/*_test.go`,
-   `gateway/*_test.go`, and the `testkit/*_test.go` multi-node suites pin the exact
-   cluster semantics (single-fire, lease takeover, single issuance, presence).
+2. `docs/*.mdx` pages listed above - semantics, guarantees, and worked examples per capability (Mintlify sources; readable as plain markdown, or `mint dev` to browse).
+3. Package godoc - every exported type/option documents its contract; start at `go doc github.com/tochemey/goakt/v4/jobs` and `go doc github.com/tochemey/goakt/v4/gateway`.
+4. `playground/jobs-demo` and `playground/gateway-echo` - minimal, runnable end-to-end wiring.
+5. Tests as specification: `actor/scheduler_persistent_test.go`, `jobs/*_test.go`, `gateway/*_test.go`, and the `testkit/*_test.go` multi-node suites pin the exact cluster semantics (single-fire, lease takeover, single issuance, presence).
 
 ## Known limitations (current round)
 
-- `jobs`: delivery targets actors only (grain delivery is a planned follow-up); the
-  lease fencing token is enforced by the in-memory store but not yet part of the
-  persisted job envelope proto.
-- `gateway`: ACME issuance is an interface slot only (static files and Cloudflare
-  Origin CA are implemented); `Inspector.Retry` currently allows retry from any state.
-- `WithClusterSingleFire` arbitration is atomic on the built-in cluster engine; for
-  custom `cluster.Cluster` implementations it degrades to best-effort (documented in
-  `internal/cluster/schedule_fire.go`).
+- `jobs`: delivery targets actors only (grain delivery is a planned follow-up); the lease fencing token is enforced by the in-memory store but not yet part of the persisted job envelope proto.
+- `gateway`: ACME issuance is an interface slot only (static files and Cloudflare Origin CA are implemented); `Inspector.Retry` currently allows retry from any state.
+- `WithClusterSingleFire` arbitration is atomic on the built-in cluster engine; for custom `cluster.Cluster` implementations it degrades to best-effort (documented in `internal/cluster/schedule_fire.go`).
