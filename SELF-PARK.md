@@ -9,7 +9,7 @@ Upstream sync policy: `upstream/main` is merged in (never rebased). Feature bran
 | Capability | Entry point | Docs |
 | --- | --- | --- |
 | Persistent scheduler queue (schedules survive restarts) | `actor.WithSchedulerJobQueue(queue, locker)` | docs/actor/scheduling.mdx ("Persistent Scheduling") |
-| Cluster single-fire schedules (one node fires per tick) | `actor.WithClusterSingleFire()` schedule option | docs/actor/scheduling.mdx |
+| Cluster single-fire cron (one node fires per tick) | intrinsic: `ScheduleWithCron` in cluster mode always arbitrates; explicit `WithReference` required (`ErrScheduleReferenceRequired`) | docs/actor/scheduling.mdx |
 | Scheduler introspection | `ActorSystem.ListSchedules()` | docs/actor/scheduling.mdx |
 | Cluster KV + distributed lock | `ActorSystem.KV()` -> `kv.Store` (Get/Put/PutIfAbsent/TTL/TryLock) | docs/clustering/kv-store.mdx |
 | Leader status + change events | `ActorSystem.IsLeader(ctx)`, `LeaderChanged` eventstream event | docs/clustering/clustered.mdx |
@@ -47,4 +47,4 @@ Version convention: tags `v4.3.0-sp.N` on this fork mark verified snapshots of s
 
 - `jobs`: delivery targets actors only (grain delivery is a planned follow-up); the lease fencing token is enforced by the in-memory store but not yet part of the persisted job envelope proto.
 - `gateway`: ACME issuance is an interface slot only (static files and Cloudflare Origin CA are implemented); `Inspector.Retry` currently allows retry from any state.
-- `WithClusterSingleFire` arbitration is atomic on the built-in cluster engine; for custom `cluster.Cluster` implementations it degrades to best-effort (documented in `internal/cluster/schedule_fire.go`).
+- Cluster single-fire is cron-only (interval/one-shot schedules stay node-local) and requires the built-in cluster engine; custom `cluster.Cluster` implementations get `ErrSingleFireUnsupported` at registration.
