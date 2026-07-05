@@ -28,20 +28,22 @@ import (
 	"testing"
 
 	"github.com/tochemey/goakt/v4/log"
+	"github.com/tochemey/goakt/v4/passivation"
 )
 
 // BenchmarkSpawnStopDefault spawns and stops one actor per iteration using the
 // framework defaults (relocatable, idle-based passivation bookkeeping). It is the
 // baseline against which BenchmarkSpawnStopEphemeral is compared for high-churn,
-// connection-shaped workloads (see WithEphemeral).
+// connection-shaped workloads (WithRelocationDisabled plus long-lived passivation).
 func BenchmarkSpawnStopDefault(b *testing.B) {
 	benchmarkSpawnStop(b)
 }
 
-// BenchmarkSpawnStopEphemeral spawns and stops one actor per iteration using
-// WithEphemeral, the option recommended for connection-lifetime actors.
+// BenchmarkSpawnStopEphemeral spawns and stops one actor per iteration using the
+// options recommended for connection-lifetime actors: relocation disabled and
+// long-lived passivation.
 func BenchmarkSpawnStopEphemeral(b *testing.B) {
-	benchmarkSpawnStop(b, WithEphemeral())
+	benchmarkSpawnStop(b, WithRelocationDisabled(), WithPassivationStrategy(passivation.NewLongLivedStrategy()))
 }
 
 // benchmarkSpawnStop drives repeated spawn/stop cycles against a standalone

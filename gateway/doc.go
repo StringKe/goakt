@@ -33,7 +33,7 @@
 //   - Only long-lived WebSocket/SSE connections get an addressable identity. Each
 //     accepted connection is registered in a local Registry and, so that it can be
 //     addressed from any node in the cluster, backed by a lightweight ephemeral actor
-//     (see actor.WithEphemeral) whose sole job is to relay a delivery to the socket it
+//     (relocation disabled, long-lived passivation) whose sole job is to relay a delivery to the socket it
 //     owns.
 //
 // Message delivery to a connection is two-tier: Registry.SendToConnection checks the

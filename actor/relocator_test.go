@@ -51,6 +51,7 @@ import (
 	"github.com/tochemey/goakt/v4/log"
 	mockscluster "github.com/tochemey/goakt/v4/mocks/cluster"
 	mocksremote "github.com/tochemey/goakt/v4/mocks/remoteclient"
+	"github.com/tochemey/goakt/v4/passivation"
 	"github.com/tochemey/goakt/v4/reentrancy"
 	"github.com/tochemey/goakt/v4/remote"
 	"github.com/tochemey/goakt/v4/supervisor"
@@ -1068,7 +1069,7 @@ func TestRelocationWithActorRelocationDisabled(t *testing.T) {
 	srv.Shutdown()
 }
 
-// TestRelocationWithEphemeralActor proves that an actor spawned with WithEphemeral,
+// TestRelocationWithEphemeralActor proves that an actor spawned with relocation disabled,
 // the option recommended for connection-lifetime actors, is excluded from relocation
 // bookkeeping the same way an actor spawned with WithRelocationDisabled is: it never
 // reappears on a surviving peer once its host node leaves the cluster.
@@ -1104,7 +1105,7 @@ func TestRelocationWithEphemeralActor(t *testing.T) {
 
 	for j := 1; j <= 4; j++ {
 		actorName := fmt.Sprintf("Node2-Actor-%d", j)
-		pid, err := node2.Spawn(ctx, actorName, NewMockActor(), WithEphemeral())
+		pid, err := node2.Spawn(ctx, actorName, NewMockActor(), WithRelocationDisabled(), WithPassivationStrategy(passivation.NewLongLivedStrategy()))
 		require.NoError(t, err)
 		require.NotNil(t, pid)
 		require.False(t, pid.IsRelocatable())

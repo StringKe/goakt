@@ -6783,7 +6783,7 @@ func TestPreShutdown(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, durablePID.IsRelocatable())
 
-		ephemeralPID, err := system.Spawn(ctx, "ephemeral", NewMockActor(), WithEphemeral())
+		ephemeralPID, err := system.Spawn(ctx, "ephemeral", NewMockActor(), WithRelocationDisabled(), WithPassivationStrategy(passivation.NewLongLivedStrategy()))
 		require.NoError(t, err)
 		require.False(t, ephemeralPID.IsRelocatable())
 

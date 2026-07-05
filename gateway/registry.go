@@ -35,6 +35,7 @@ import (
 	"github.com/tochemey/goakt/v4/actor"
 	gerrors "github.com/tochemey/goakt/v4/errors"
 	"github.com/tochemey/goakt/v4/log"
+	"github.com/tochemey/goakt/v4/passivation"
 )
 
 // connEntry is the bookkeeping Registry keeps for one locally registered connection.
@@ -84,7 +85,7 @@ type Registry struct {
 }
 
 // NewRegistry creates a Registry backed by system. system is used to spawn the
-// per-connection ephemeral actors (see actor.WithEphemeral) that make registered
+// per-connection ephemeral actors (relocation disabled, long-lived passivation) that make registered
 // connections addressable from other nodes, and to bridge topic broadcasts across the
 // cluster via ActorSystem.SubscribeTopic.
 func NewRegistry(system actor.ActorSystem, logger log.Logger) *Registry {
@@ -140,7 +141,11 @@ func (r *Registry) Register(ctx context.Context, id string, send func([]byte) er
 		registerSpawnBarrier(id)
 	}
 
-	pid, spawnErr := r.system.Spawn(ctx, connActorName(id), newConnActor(send), actor.WithEphemeral())
+	// no relocation (socket dies with its node), no passivation (Unregister stops it)
+	pid, spawnErr := r.system.Spawn(ctx, connActorName(id), newConnActor(send),
+		actor.WithRelocationDisabled(),
+		actor.WithPassivationStrategy(passivation.NewLongLivedStrategy()),
+	)
 
 	r.mu.Lock()
 	if entry.dead || spawnErr != nil {

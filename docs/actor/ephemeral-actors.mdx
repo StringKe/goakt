@@ -1,6 +1,6 @@
 ---
 title: Ephemeral Actors
-description: Spawn options for high-churn, connection-lifetime actors.
+description: The spawn recipe for high-churn, connection-lifetime actors.
 sidebarTitle: "Ephemeral Actors"
 ---
 
@@ -11,24 +11,17 @@ These actors should **never** participate in cluster bookkeeping designed for lo
 - **Relocation** — if the node hosting a connection actor crashes or leaves, the underlying socket is already gone. Recreating the actor on another node produces an actor with no connection to serve; it is pure waste.
 - **Idle-based passivation** — the actor's lifetime is already driven by an external event (the connection closing). Registering it with the passivation manager's timer bookkeeping adds a heap insert/remove on every spawn/stop for a timer that will never fire.
 
-`WithEphemeral` is a single, self-describing [`SpawnOption`](/actor/actor-system) that captures this intent instead of a recipe of unrelated options.
-
-## Usage
+Both concerns are covered by combining two existing [`SpawnOption`](/actor/actor-system) values:
 
 ```go
 pid, err := system.Spawn(ctx, connectionID, NewConnectionActor(conn),
-    actor.WithEphemeral())
-```
-
-`WithEphemeral` is equivalent to combining:
-
-```go
-actor.WithRelocationDisabled()
-actor.WithPassivationStrategy(passivation.NewLongLivedStrategy())
+    actor.WithRelocationDisabled(),
+    actor.WithPassivationStrategy(passivation.NewLongLivedStrategy()),
+)
 ```
 
 <Note>
-`WithEphemeral` does not stop the actor for you. You are expected to call `pid.Shutdown(ctx)` (or send a `Shutdown`/stop message) when the underlying connection closes — that is the whole point: the actor's lifetime is driven by the connection, not by an idle timer.
+This recipe does not stop the actor for you. You are expected to call `pid.Shutdown(ctx)` (or send a `Shutdown`/stop message) when the underlying connection closes — that is the whole point: the actor's lifetime is driven by the connection, not by an idle timer.
 </Note>
 
 <Warning>
@@ -40,7 +33,7 @@ Ephemeral actors are still subject to [system eviction](/actor/passivation#syste
 A common gateway shape looks like this:
 
 1. A client opens a websocket or SSE connection to any node in the cluster.
-2. The node spawns one actor per connection with `WithEphemeral`, using the connection ID as the actor name so it can be addressed by other nodes.
+2. The node spawns one actor per connection with the recipe above, using the connection ID as the actor name so it can be addressed by other nodes.
 3. Inbound messages from the socket are `Tell`'d to the actor; outbound messages are written directly to the socket from within the actor (or from a `Receive` handler holding the connection).
 4. When the socket closes (client disconnect, read/write error, or server shutdown), the caller stops the actor immediately: `pid.Shutdown(ctx)`.
 5. If the node crashes or leaves the cluster, the connection is already dead — the actor is correctly **not** relocated, and the client is expected to reconnect (to any node) and get a fresh actor.
@@ -65,20 +58,15 @@ func (a *ConnectionActor) PostStop(*actor.Context) error {
 
 // on connection accept
 pid, err := system.Spawn(ctx, connectionID, &ConnectionActor{conn: conn},
-    actor.WithEphemeral())
+    actor.WithRelocationDisabled(),
+    actor.WithPassivationStrategy(passivation.NewLongLivedStrategy()),
+)
 
 // on connection close (read loop exit, client disconnect, etc.)
 _ = pid.Shutdown(ctx)
 ```
 
-## Why not just use existing options
-
-`WithRelocationDisabled` and `WithPassivationStrategy(passivation.NewLongLivedStrategy())` already exist and can be combined manually. `WithEphemeral` exists because:
-
-- The combination is easy to get wrong or forget one half of (e.g. disabling relocation but leaving the default idle-based passivation registered).
-- The name documents *intent* — "this actor represents a connection and is explicitly managed" — rather than a list of unrelated knobs.
-
-If your actor is long-lived but must not relocate (e.g. it owns node-local state), use `WithRelocationDisabled` directly; `WithEphemeral` is specifically for the high-churn, externally-driven-lifetime case.
+If your actor is long-lived but must not relocate (e.g. it owns node-local state), `WithRelocationDisabled` alone is enough; the passivation half of the recipe is specifically for the high-churn, externally-driven-lifetime case.
 
 ## See also
 

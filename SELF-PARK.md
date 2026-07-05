@@ -17,7 +17,7 @@ Upstream sync policy: `upstream/main` is merged in (never rebased). Feature bran
 | Crash relocation (kill -9 recovery via placement journal) | `actor.WithPlacementJournal(store)` | docs/actor/crash-relocation.mdx |
 | Non-actor pub/sub subscriptions | `ActorSystem.SubscribeTopic(topic, handler)` | docs/advanced/pubsub-bridge.mdx |
 | Topic presence / introspection | `TopicSubscriberCount` / `TopicSubscribers` / `Topics` | docs/advanced/pubsub.mdx ("Presence and introspection") |
-| Ephemeral high-churn actors | `actor.WithEphemeral()` spawn option | docs/actor/ephemeral-actors.mdx |
+| Ephemeral high-churn actors | pattern: `WithRelocationDisabled()` + `WithPassivationStrategy(passivation.NewLongLivedStrategy())` (upstream already had both; our sugar option was removed after upstream review) | docs/actor/ephemeral-actors.mdx |
 | Durable jobs: at-least-once, retry/DLQ, fan-out/fan-in, inspector | package `jobs` (`jobs.NewEngine`) | docs/advanced/jobs.mdx |
 | Gateway: cluster-shared TLS (Cloudflare Origin CA), WS/SSE connection registry, two-tier delivery, shutdown draining | package `gateway` (`gateway.NewServer`, `gateway.NewRegistry`) | docs/advanced/gateway.mdx |
 
@@ -29,7 +29,7 @@ The module path is unchanged (`github.com/tochemey/goakt/v4`), so consumption go
 
 ```bash
 go mod edit -require=github.com/tochemey/goakt/v4@v4.2.13
-go mod edit -replace=github.com/tochemey/goakt/v4=github.com/StringKe/goakt/v4@v4.3.0-sp.1
+go mod edit -replace=github.com/tochemey/goakt/v4=github.com/StringKe/goakt/v4@v4.3.0-sp.2
 go mod tidy
 ```
 

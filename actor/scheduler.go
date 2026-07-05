@@ -156,8 +156,7 @@ func (x *scheduler) rebuildScheduledKeys() {
 		}
 
 		x.scheduledKeys.Set(msgJob.envelope.GetReference(), jobKey)
-		// Introspection metadata must be rebuilt alongside the job key: without it,
-		// ListSchedules would report nothing for schedules that survived a restart.
+		// without this, ListSchedules reports nothing for schedules that survived a restart
 		x.recordSchedule(msgJob.envelope.GetReference(), scheduleMetaFromEnvelope(msgJob.envelope))
 	}
 }

@@ -229,7 +229,7 @@ shutdown path before `http.Server.Shutdown`.
 
 ## See also
 
-- [Ephemeral Actors](/actor/ephemeral-actors) — the `WithEphemeral` spawn option backing every registered connection
+- [Ephemeral Actors](/actor/ephemeral-actors) — the connection-actor spawn recipe (relocation disabled, long-lived passivation) backing every registered connection
 - [PubSub Bridge](/advanced/pubsub-bridge) — the non-actor subscription primitive `Registry.Broadcast` uses for cross-node fan-out
 - [Cluster KV Store](/clustering/kv-store) — the `kv.Store` primitive `Manager` uses for issuance arbitration and certificate distribution
 - A runnable sample lives in `playground/gateway-echo` in the repository: a WebSocket echo server plus a cross-instance `SendToConnection` demo.
