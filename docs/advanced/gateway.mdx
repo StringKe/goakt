@@ -121,9 +121,9 @@ tlsConfig := manager.TLSConfig() // GetCertificate wired for SNI lookup
   restart doesn't need the cluster at all). `CertStore` defaults to an in-memory
   implementation; plug in a persistent one to survive a full cluster cold start without
   re-issuing.
-- **Renewal.** Driven by a [`WithClusterSingleFire`](/actor/scheduling#cluster-wide-single-fire)
-  cron schedule (default: hourly checks, configurable via `WithRenewInterval`), so
-  exactly one node re-checks/re-issues per tick regardless of cluster size.
+- **Renewal.** Driven by a [cron schedule](/actor/scheduling) (default: hourly checks,
+  configurable via `WithRenewInterval`); cron schedules fire once cluster-wide by scheduler
+  design, so exactly one node re-checks/re-issues per tick regardless of cluster size.
 - **SNI lookup.** `Manager.GetCertificate` implements the `tls.Config.GetCertificate`
   signature directly, so `tlsConfig.GetCertificate = manager.GetCertificate` (or
   `manager.TLSConfig()`) is all a listener needs.

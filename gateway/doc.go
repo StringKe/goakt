@@ -49,6 +49,6 @@
 // cluster-wide: issuance is arbitrated through the cluster's distributed lock
 // (kv.Store.TryLock), the resulting certificate is distributed to every node via the
 // cluster KV store (kv.Store), and renewal is driven by a cluster-single-fire schedule
-// (actor.WithClusterSingleFire) so only one node re-issues per renewal window. See
+// (cron schedules are single-fire cluster-wide by scheduler design) so only one node re-issues per renewal window. See
 // Manager, CertIssuer, and CertStore.
 package gateway

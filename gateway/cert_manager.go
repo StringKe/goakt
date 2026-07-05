@@ -70,8 +70,8 @@ type cachedCert struct {
 // Manager terminates TLS for one or more domains from certificates shared across the
 // whole cluster: issuance for a given domain is arbitrated so exactly one node calls the
 // configured CertIssuer, the result is distributed to every node through the actor
-// system's cluster KV store (see kv.Store), and a cluster-single-fire schedule (see
-// actor.WithClusterSingleFire) drives renewal ahead of expiry.
+// system's cluster KV store (see kv.Store), and a cron renewal schedule (single-fire
+// cluster-wide by scheduler design) drives renewal ahead of expiry.
 //
 // Outside cluster mode, Manager still works: issuance is deduplicated locally (so
 // concurrent handshakes for a cold domain only call the issuer once) and certificates
@@ -182,7 +182,6 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.renewalPID = pid
 
 	if err := m.system.ScheduleWithCron(ctx, &emptypb.Empty{}, pid, m.renewInterval,
-		actor.WithClusterSingleFire(),
 		actor.WithReference(certRenewalReference),
 	); err != nil {
 		return fmt.Errorf("gateway: failed to register certificate renewal schedule: %w", err)

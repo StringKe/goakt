@@ -152,8 +152,7 @@ execution, retry, and dead-lettering of each triggered run:
 ```go
 // tick handler: one node per tick enqueues the durable run
 system.ScheduleWithCron(ctx, &emptypb.Empty{}, tickerPID, "0 */5 * * * *",
-    actor.WithClusterSingleFire(),
-    actor.WithReference("rewards-recalc"),
+    actor.WithReference("rewards-recalc"), // required in cluster mode; cron fires once cluster-wide
 )
 
 // inside tickerPID's Receive: turn the tick into an at-least-once job

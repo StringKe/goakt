@@ -316,7 +316,7 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 		assert.Equal(t, pid.Name(), byRef["intro-once"].Address)
 	})
 
-	t.Run("WithClusterSingleFire is carried in the envelope and fails open outside cluster mode", func(t *testing.T) {
+	t.Run("cron envelopes outside cluster mode do not carry the single-fire flag", func(t *testing.T) {
 		sys, pid := newPersistentTestSystem(t, "persist-singlefire", "target")
 
 		queue := newFakeJobQueue(sys)
@@ -325,22 +325,19 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 		sched.Start(context.TODO())
 
 		message := new(testpb.TestSend)
-		require.NoError(t, sched.ScheduleOnce(message, pid, 300*time.Millisecond,
-			WithReference("singlefire-ref"), WithClusterSingleFire()))
+		require.NoError(t, sched.ScheduleWithCron(message, pid, "* * * ? * *", WithReference("singlefire-ref")))
 
-		// the option must be persisted in the envelope, or the single-fire guarantee
-		// would silently vanish for every schedule rebuilt after a restart.
+		// single fire is intrinsic to cron in CLUSTER mode only: a non-cluster system
+		// must persist the envelope without the flag so a restart never arbitrates.
 		jobs, err := queue.ScheduledJobs(nil)
 		require.NoError(t, err)
 		require.Len(t, jobs, 1)
 		msgJob, ok := jobs[0].JobDetail().Job().(*scheduledMessageJob)
 		require.True(t, ok)
-		assert.True(t, msgJob.envelope.GetClusterSingleFire())
+		assert.False(t, msgJob.envelope.GetClusterSingleFire())
 
-		// outside cluster mode the claim fails open: delivery happens exactly as
-		// without the option.
-		pause.For(700 * time.Millisecond)
-		assert.EqualValues(t, 1, pid.ProcessedCount()-1)
+		pause.For(1500 * time.Millisecond)
+		assert.GreaterOrEqual(t, int(pid.ProcessedCount()-1), 1)
 		sched.Stop(context.TODO())
 	})
 

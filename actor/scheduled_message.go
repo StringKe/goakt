@@ -85,7 +85,12 @@ func (j *scheduledMessageJob) Execute(ctx context.Context) error {
 	envelope := j.envelope
 
 	if envelope.GetClusterSingleFire() {
-		won, err := claimScheduleFireTick(ctx, j.system, envelope.GetReference())
+		// the TTL is re-derived from the persisted trigger, mirroring registration
+		ttl := minScheduleFireClaimTTL
+		if trigger, err := ScheduledMessageTrigger(envelope); err == nil {
+			ttl = cronClaimTTL(trigger)
+		}
+		won, err := claimScheduleFireTick(ctx, j.system, envelope.GetReference(), ttl)
 		if err != nil {
 			return fmt.Errorf("failed to claim single-fire tick for reference=%s: %w", envelope.GetReference(), err)
 		}
