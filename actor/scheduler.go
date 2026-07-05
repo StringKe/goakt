@@ -156,7 +156,29 @@ func (x *scheduler) rebuildScheduledKeys() {
 		}
 
 		x.scheduledKeys.Set(msgJob.envelope.GetReference(), jobKey)
+		// Introspection metadata must be rebuilt alongside the job key: without it,
+		// ListSchedules would report nothing for schedules that survived a restart.
+		x.recordSchedule(msgJob.envelope.GetReference(), scheduleMetaFromEnvelope(msgJob.envelope))
 	}
+}
+
+// scheduleMetaFromEnvelope rebuilds the introspection metadata for a schedule restored
+// from a persistent JobQueue. The envelope only carries the target's name (resolution
+// happens by name at fire time), so Address is that name rather than a full path.
+func scheduleMetaFromEnvelope(envelope *internalpb.ScheduledMessage) *scheduleMeta {
+	meta := &scheduleMeta{address: envelope.GetTargetName()}
+	switch trigger := envelope.GetTrigger().GetKind().(type) {
+	case *internalpb.ScheduleTrigger_Once:
+		meta.kind = TriggerKindOnce
+		meta.interval = trigger.Once.GetDelay().AsDuration()
+	case *internalpb.ScheduleTrigger_Interval:
+		meta.kind = TriggerKindInterval
+		meta.interval = trigger.Interval.GetInterval().AsDuration()
+	case *internalpb.ScheduleTrigger_Cron:
+		meta.kind = TriggerKindCron
+		meta.expression = trigger.Cron.GetExpression()
+	}
+	return meta
 }
 
 // Stop stops the scheduler
@@ -475,10 +497,11 @@ func (x *scheduler) buildEnvelope(to *PID, message any, cfg *scheduleConfig, tri
 	}
 
 	envelope := &internalpb.ScheduledMessage{
-		Reference:  cfg.Reference(),
-		TargetName: to.Name(),
-		Payload:    payload,
-		Trigger:    triggerSpec,
+		Reference:         cfg.Reference(),
+		TargetName:        to.Name(),
+		Payload:           payload,
+		Trigger:           triggerSpec,
+		ClusterSingleFire: cfg.ClusterSingleFire(),
 	}
 
 	noSender := x.actorSystem.NoSender()
@@ -503,7 +526,15 @@ const clusterSingleFireClaimTTL = time.Minute
 // (returns true) rather than silently dropping every delivery: the option is documented as a
 // no-op outside cluster mode.
 func (x *scheduler) claimClusterFire(ctx context.Context, reference string) (bool, error) {
-	if !x.actorSystem.InCluster() {
+	return claimScheduleFireTick(ctx, x.actorSystem, reference)
+}
+
+// claimScheduleFireTick is the arbitration shared by the closure-based job path
+// (claimClusterFire) and the persistent-envelope path (scheduledMessageJob.Execute),
+// so WithClusterSingleFire keeps its exactly-one-node guarantee after a restart
+// rebuilds schedules from a persistent JobQueue.
+func claimScheduleFireTick(ctx context.Context, system ActorSystem, reference string) (bool, error) {
+	if !system.InCluster() {
 		return true, nil
 	}
 
@@ -513,7 +544,7 @@ func (x *scheduler) claimClusterFire(ctx context.Context, reference string) (boo
 	}
 
 	key := fmt.Sprintf("%s@%d", reference, metadata.RunTime)
-	err := cluster.ClaimScheduleFire(ctx, x.actorSystem.getCluster(), key, clusterSingleFireClaimTTL)
+	err := cluster.ClaimScheduleFire(ctx, system.getCluster(), key, clusterSingleFireClaimTTL)
 	switch {
 	case err == nil:
 		return true, nil

@@ -137,6 +137,37 @@ func (a *RewardAggregator) Receive(ctx *actor.ReceiveContext) {
 }
 ```
 
+## Recurring and delayed jobs
+
+Delayed execution is built in: enqueue with `jobs.WithDelay` and the engine delivers the
+job once the delay elapses, with full at-least-once semantics (the delay survives a node
+crash because it lives in the `Store`, not in a timer).
+
+Recurring (cron) jobs compose with the scheduler rather than duplicating it: register a
+cluster-single-fire cron schedule whose handler enqueues a job on every tick. The
+schedule contributes "exactly one node triggers per tick" and, with a persistent
+JobQueue, "the cron itself survives restarts"; the jobs engine contributes at-least-once
+execution, retry, and dead-lettering of each triggered run:
+
+```go
+// tick handler: one node per tick enqueues the durable run
+system.ScheduleWithCron(ctx, &emptypb.Empty{}, tickerPID, "0 */5 * * * *",
+    actor.WithClusterSingleFire(),
+    actor.WithReference("rewards-recalc"),
+)
+
+// inside tickerPID's Receive: turn the tick into an at-least-once job
+job, _ := jobs.New("rewards-recalc", payload)
+_ = engine.Enqueue(ctx, job)
+```
+
+<Note>
+This split keeps each layer honest: a missed handler crash after `Enqueue` is retried by
+the engine, while a node crash before `Enqueue` only skips one tick, which the next cron
+tick makes up for. Workloads needing stronger tick-to-job atomicity can enqueue with a
+deterministic job ID derived from the tick time, making the enqueue idempotent.
+</Note>
+
 ## Inspecting jobs
 
 ```go

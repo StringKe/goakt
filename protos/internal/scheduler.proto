@@ -32,6 +32,11 @@ message ScheduledMessage {
   bytes payload = 4;
   // Specifies when the message fires.
   ScheduleTrigger trigger = 5;
+  // Specifies whether delivery of each trigger tick must be arbitrated
+  // cluster-wide so exactly one node fires (see actor.WithClusterSingleFire).
+  // Carried in the envelope so the semantics survive a process restart when
+  // the schedule is rebuilt from a persistent JobQueue.
+  bool cluster_single_fire = 6;
 }
 
 // ScheduleTrigger describes one of the three trigger kinds supported by the

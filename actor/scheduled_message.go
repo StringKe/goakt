@@ -84,6 +84,16 @@ func (j *scheduledMessageJob) Description() string {
 func (j *scheduledMessageJob) Execute(ctx context.Context) error {
 	envelope := j.envelope
 
+	if envelope.GetClusterSingleFire() {
+		won, err := claimScheduleFireTick(ctx, j.system, envelope.GetReference())
+		if err != nil {
+			return fmt.Errorf("failed to claim single-fire tick for reference=%s: %w", envelope.GetReference(), err)
+		}
+		if !won {
+			return nil
+		}
+	}
+
 	target, err := j.system.ActorOf(ctx, envelope.GetTargetName())
 	if err != nil {
 		return fmt.Errorf("failed to resolve scheduled message target=%s: %w", envelope.GetTargetName(), err)

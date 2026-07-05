@@ -274,6 +274,76 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 		assert.EqualValues(t, 1, pid.ProcessedCount()-1)
 	})
 
+	t.Run("ListSchedules reports schedules rebuilt from the persistent queue", func(t *testing.T) {
+		sys, pid := newPersistentTestSystem(t, "persist-introspect", "target")
+
+		queue := newFakeJobQueue(sys)
+		locker := new(sync.Mutex)
+		sched := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
+		sched.Start(context.TODO())
+
+		message := new(testpb.TestSend)
+		require.NoError(t, sched.ScheduleOnce(message, pid, time.Hour, WithReference("intro-once")))
+		require.NoError(t, sched.Schedule(message, pid, time.Hour, WithReference("intro-interval")))
+		require.NoError(t, sched.ScheduleWithCron(message, pid, "0 0 * * * *", WithReference("intro-cron")))
+
+		sched.Stop(context.TODO())
+
+		restarted := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
+		restarted.Start(context.TODO())
+		defer restarted.Stop(context.TODO())
+
+		infos := restarted.ListSchedules()
+		byRef := make(map[string]ScheduleInfo, len(infos))
+		for _, info := range infos {
+			byRef[info.Reference] = info
+		}
+
+		require.Contains(t, byRef, "intro-once")
+		assert.Equal(t, TriggerKindOnce, byRef["intro-once"].TriggerKind)
+		assert.Equal(t, time.Hour, byRef["intro-once"].Interval)
+
+		require.Contains(t, byRef, "intro-interval")
+		assert.Equal(t, TriggerKindInterval, byRef["intro-interval"].TriggerKind)
+		assert.Equal(t, time.Hour, byRef["intro-interval"].Interval)
+
+		require.Contains(t, byRef, "intro-cron")
+		assert.Equal(t, TriggerKindCron, byRef["intro-cron"].TriggerKind)
+		assert.Equal(t, "0 0 * * * *", byRef["intro-cron"].Expression)
+
+		// the envelope only carries the target's name, so that is what Address reports
+		// for a rebuilt schedule.
+		assert.Equal(t, pid.Name(), byRef["intro-once"].Address)
+	})
+
+	t.Run("WithClusterSingleFire is carried in the envelope and fails open outside cluster mode", func(t *testing.T) {
+		sys, pid := newPersistentTestSystem(t, "persist-singlefire", "target")
+
+		queue := newFakeJobQueue(sys)
+		locker := new(sync.Mutex)
+		sched := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
+		sched.Start(context.TODO())
+
+		message := new(testpb.TestSend)
+		require.NoError(t, sched.ScheduleOnce(message, pid, 300*time.Millisecond,
+			WithReference("singlefire-ref"), WithClusterSingleFire()))
+
+		// the option must be persisted in the envelope, or the single-fire guarantee
+		// would silently vanish for every schedule rebuilt after a restart.
+		jobs, err := queue.ScheduledJobs(nil)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		msgJob, ok := jobs[0].JobDetail().Job().(*scheduledMessageJob)
+		require.True(t, ok)
+		assert.True(t, msgJob.envelope.GetClusterSingleFire())
+
+		// outside cluster mode the claim fails open: delivery happens exactly as
+		// without the option.
+		pause.For(700 * time.Millisecond)
+		assert.EqualValues(t, 1, pid.ProcessedCount()-1)
+		sched.Stop(context.TODO())
+	})
+
 	t.Run("Schedule interval survives a scheduler Stop/Start cycle", func(t *testing.T) {
 		sys, pid := newPersistentTestSystem(t, "persist-interval", "target")
 

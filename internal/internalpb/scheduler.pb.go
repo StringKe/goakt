@@ -48,9 +48,14 @@ type ScheduledMessage struct {
 	// out-of-band coordination.
 	Payload []byte `protobuf:"bytes,4,opt,name=payload,proto3" json:"payload,omitempty"`
 	// Specifies when the message fires.
-	Trigger       *ScheduleTrigger `protobuf:"bytes,5,opt,name=trigger,proto3" json:"trigger,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Trigger *ScheduleTrigger `protobuf:"bytes,5,opt,name=trigger,proto3" json:"trigger,omitempty"`
+	// Specifies whether delivery of each trigger tick must be arbitrated
+	// cluster-wide so exactly one node fires (see actor.WithClusterSingleFire).
+	// Carried in the envelope so the semantics survive a process restart when
+	// the schedule is rebuilt from a persistent JobQueue.
+	ClusterSingleFire bool `protobuf:"varint,6,opt,name=cluster_single_fire,json=clusterSingleFire,proto3" json:"cluster_single_fire,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *ScheduledMessage) Reset() {
@@ -116,6 +121,13 @@ func (x *ScheduledMessage) GetTrigger() *ScheduleTrigger {
 		return x.Trigger
 	}
 	return nil
+}
+
+func (x *ScheduledMessage) GetClusterSingleFire() bool {
+	if x != nil {
+		return x.ClusterSingleFire
+	}
+	return false
 }
 
 // ScheduleTrigger describes one of the three trigger kinds supported by the
@@ -371,7 +383,7 @@ var File_internal_scheduler_proto protoreflect.FileDescriptor
 const file_internal_scheduler_proto_rawDesc = "" +
 	"\n" +
 	"\x18internal/scheduler.proto\x12\n" +
-	"internalpb\x1a\x1egoogle/protobuf/duration.proto\"\xc3\x01\n" +
+	"internalpb\x1a\x1egoogle/protobuf/duration.proto\"\xf3\x01\n" +
 	"\x10ScheduledMessage\x12\x1c\n" +
 	"\treference\x18\x01 \x01(\tR\treference\x12\x1f\n" +
 	"\vtarget_name\x18\x02 \x01(\tR\n" +
@@ -379,7 +391,8 @@ const file_internal_scheduler_proto_rawDesc = "" +
 	"\vsender_name\x18\x03 \x01(\tR\n" +
 	"senderName\x12\x18\n" +
 	"\apayload\x18\x04 \x01(\fR\apayload\x125\n" +
-	"\atrigger\x18\x05 \x01(\v2\x1b.internalpb.ScheduleTriggerR\atrigger\"\xb2\x01\n" +
+	"\atrigger\x18\x05 \x01(\v2\x1b.internalpb.ScheduleTriggerR\atrigger\x12.\n" +
+	"\x13cluster_single_fire\x18\x06 \x01(\bR\x11clusterSingleFire\"\xb2\x01\n" +
 	"\x0fScheduleTrigger\x12-\n" +
 	"\x04once\x18\x01 \x01(\v2\x17.internalpb.OnceTriggerH\x00R\x04once\x129\n" +
 	"\binterval\x18\x02 \x01(\v2\x1b.internalpb.IntervalTriggerH\x00R\binterval\x12-\n" +
