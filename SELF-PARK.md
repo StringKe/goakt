@@ -9,14 +9,14 @@ Upstream sync policy: `upstream/main` is merged in (never rebased). Feature bran
 | Capability | Entry point | Docs |
 | --- | --- | --- |
 | Persistent scheduler queue (schedules survive restarts) | `actor.WithSchedulerJobQueue(queue, locker)` | docs/actor/scheduling.mdx ("Persistent Scheduling") |
-| Cluster single-fire cron (one node fires per tick) | intrinsic: `ScheduleWithCron` in cluster mode always arbitrates; explicit `WithReference` required (`ErrScheduleReferenceRequired`) | docs/actor/scheduling.mdx |
-| Scheduler introspection | `ActorSystem.ListSchedules()` -> `ScheduleInfo{Reference, Path}` (narrowed per upstream review) | docs/actor/scheduling.mdx |
+| Cluster single-fire cron (one node fires per tick) | **upstream-native** since #1242: intrinsic in cluster mode, explicit `WithReference` required | docs/actor/scheduling.mdx |
+| Scheduler introspection | **upstream-native** since #1241: `ActorSystem.ListSchedules()` -> `ScheduleInfo{Reference, Path}` | docs/actor/scheduling.mdx |
 | Cluster KV + distributed lock | `ActorSystem.KV()` -> `kv.Store` (Get/Put/PutIfAbsent/TTL/TryLock) | docs/clustering/kv-store.mdx |
-| Leader status + change events | `ActorSystem.IsLeader(ctx)`, `LeaderChanged` eventstream event | docs/clustering/clustered.mdx |
+| Leader status + change events | **upstream-native** since #1239: `ActorSystem.IsLeader(ctx)`/`Leader(ctx)`, `LeaderChanged` eventstream event | docs/clustering/clustered.mdx |
 | Cluster-wide rate limiting | `ratelimit.New(store, limit, window)` | docs/clustering/rate-limiting.mdx |
 | Crash relocation (kill -9 recovery via placement journal) | `actor.WithPlacementJournal(store)` | docs/actor/crash-relocation.mdx |
 | Non-actor pub/sub subscriptions | `ActorSystem.SubscribeTopic(topic, handler)` | docs/advanced/pubsub-bridge.mdx |
-| Topic statistics | `ActorSystem.TopicStats(ctx, topic, timeout)` -> local subscriber count + cluster instance count (reworked to the upstream maintainer's design; subscriber identities are not exposed) | docs/advanced/pubsub.mdx ("Topic statistics") |
+| Topic statistics | **upstream-native** since #1246: `ActorSystem.TopicStats(ctx, topic, timeout)` -> local subscriber count + cluster instance count | docs/advanced/pubsub.mdx ("Topic statistics") |
 | Ephemeral high-churn actors | pattern: `WithRelocationDisabled()` + `WithPassivationStrategy(passivation.NewLongLivedStrategy())` (upstream already had both; our sugar option was removed after upstream review) | docs/actor/ephemeral-actors.mdx |
 | Durable jobs: at-least-once, retry/DLQ, fan-out/fan-in, inspector | package `jobs` (`jobs.NewEngine`) | docs/advanced/jobs.mdx |
 | Gateway: cluster-shared TLS (Cloudflare Origin CA), WS/SSE connection registry, two-tier delivery, shutdown draining | package `gateway` (`gateway.NewServer`, `gateway.NewRegistry`) | docs/advanced/gateway.mdx |
@@ -47,4 +47,4 @@ Version convention: tags `v4.3.0-sp.N` on this fork mark verified snapshots of s
 
 - `jobs`: delivery targets actors only (grain delivery is a planned follow-up); the lease fencing token is enforced by the in-memory store but not yet part of the persisted job envelope proto.
 - `gateway`: ACME issuance is an interface slot only (static files and Cloudflare Origin CA are implemented); `Inspector.Retry` currently allows retry from any state.
-- Cluster single-fire is cron-only (interval/one-shot schedules stay node-local) and requires the built-in cluster engine; custom `cluster.Cluster` implementations get `ErrSingleFireUnsupported` at registration.
+- Cluster single-fire is cron-only (interval/one-shot schedules stay node-local); claim entries are reclaimed by TTL alone, and a node reaching a tick later than the claim TTL skips it (upstream semantics).
