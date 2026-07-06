@@ -70,7 +70,14 @@ const (
 	namespaceJobs   recordNamespace = "jobs"
 	namespaceKV     recordNamespace = "kv"
 	namespaceLocks  recordNamespace = "locks"
+	// namespaceScheduleFire stores the short-lived fire claims used to arbitrate which node
+	// delivers a given tick of a cluster-wide cron schedule (see actor.ScheduleWithCron).
+	namespaceScheduleFire recordNamespace = "schedule-fire"
 )
+
+// scheduleFireClaimValue is the placeholder payload for a schedule-fire claim entry; only the
+// key's existence matters for arbitration.
+var scheduleFireClaimValue = []byte{1}
 
 func composeKey(namespace recordNamespace, id string) string {
 	return fmt.Sprintf("%s%s%s", string(namespace), namespaceSeparator, id)
@@ -123,6 +130,11 @@ type Cluster interface {
 	GetPartition(actorName string) uint64
 	// IsRunning reports whether the cluster engine is currently running.
 	IsRunning() bool
+	// ClaimScheduleFire atomically claims the exclusive right to deliver one trigger tick of
+	// a cluster-wide cron schedule. It returns nil for the winning caller and
+	// ErrScheduleFireClaimed for every other caller racing for the same key; see the
+	// builtin implementation for the key and ttl contract.
+	ClaimScheduleFire(ctx context.Context, key string, ttl time.Duration) error
 	// PutJobKey stores job metadata.
 	PutJobKey(ctx context.Context, jobID string, metadata []byte) error
 	// DeleteJobKey removes job metadata.
@@ -212,6 +224,12 @@ type cluster struct {
 	rebalanceLeftLatestEpoch uint64
 	rebalanceStartSeen       map[uint64]struct{}
 	rebalanceCompleteSeen    map[uint64]struct{}
+
+	// lastCoordinatorAddr caches the coordinator's peers address to detect
+	// leadership changes. It is seeded (non-empty) in Start before the consume
+	// goroutine launches and thereafter touched only while holding eventsLock, so
+	// it never races. Only changes away from this baseline emit LeaderChanged.
+	lastCoordinatorAddr string
 
 	running *atomic.Bool
 }
@@ -308,6 +326,14 @@ func (x *cluster) Start(ctx context.Context) error {
 	}
 
 	x.running.Store(true)
+
+	// Seed the leadership baseline silently. The engine has synced membership by
+	// the time it reaches this point, so a running cluster always has a visible
+	// coordinator (at minimum the local node). This runs before the consume
+	// goroutine launches, so lastCoordinatorAddr is not written concurrently, and
+	// only later changes are emitted as LeaderChanged.
+	x.lastCoordinatorAddr = x.coordinatorAddress(ctx)
+
 	x.consumeCtx, x.consumeCancel = context.WithCancel(ctx)
 	x.consumeWg.Go(func() {
 		x.consume()
@@ -814,6 +840,37 @@ func (x *cluster) IsLeader(ctx context.Context) bool {
 	return false
 }
 
+// coordinatorAddress returns the peers address of the current cluster
+// coordinator as reported by the engine, or empty when the membership cannot be
+// read. A running cluster always has a coordinator, so this only returns empty
+// on a transient fetch failure.
+func (x *cluster) coordinatorAddress(ctx context.Context) string {
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+
+	if x.client == nil {
+		return ""
+	}
+
+	members, err := x.client.Members(ctx)
+	if err != nil {
+		x.logger.Errorf("failed to fetch cluster members: %v (hint: check cluster connectivity)", err)
+		return ""
+	}
+
+	for _, member := range members {
+		if !member.Coordinator {
+			continue
+		}
+
+		node := new(discovery.Node)
+		_ = json.Unmarshal([]byte(member.Meta), node)
+		return node.PeersAddress()
+	}
+
+	return ""
+}
+
 // GetPartition returns the partition identifier used to distribute the actor
 // key in the unified map.
 func (x *cluster) GetPartition(actorName string) uint64 {
@@ -905,6 +962,51 @@ func (x *cluster) JobKey(ctx context.Context, jobID string) ([]byte, error) {
 	defer x.mu.RUnlock()
 
 	return x.getRecord(ctx, namespaceJobs, jobID)
+}
+
+// ClaimScheduleFire attempts to claim the exclusive right to deliver one trigger tick of a
+// cluster-wide cron schedule, using the same atomic put-if-absent (NX+EX) primitive that
+// guarantees single grain activation across the cluster.
+//
+// key uniquely identifies the (schedule reference, trigger tick) pair being arbitrated: callers
+// are expected to derive it from a value that is identical across every node racing for the same
+// tick (e.g. the trigger's deterministic next-fire timestamp), so a fresh key is used per tick.
+//
+// Because the key is per tick, a caller whose claim arrives after the winner's entry has
+// expired would win again and deliver a duplicate: callers must therefore never claim a tick
+// older than ttl (the actor scheduler skips such stale ticks before calling this). Claim
+// entries are reclaimed by their TTL alone; there is no explicit delete, so a claim outlives
+// cancellations and node shutdowns by design.
+//
+// Returns nil for the caller that wins the race for key (it must proceed to deliver), and
+// ErrScheduleFireClaimed for every other caller racing for the same key (it must skip delivery
+// for that tick silently).
+func (x *cluster) ClaimScheduleFire(ctx context.Context, key string, ttl time.Duration) error {
+	if !x.running.Load() {
+		return ErrEngineNotRunning
+	}
+
+	if key == "" {
+		return errors.New("schedule fire key is empty")
+	}
+
+	// Unlike the registration-time write paths, this runs on every cron tick, so it takes the
+	// read lock only (same as RemoveActor): atomicity comes from the server-side NX+EX write,
+	// not from the local mutex, and holding the write lock across a network round trip per
+	// tick would stall actor placement and lookups behind schedule arbitration.
+	x.mu.RLock()
+	defer x.mu.RUnlock()
+
+	err := x.putRecordIfAbsent(ctx, namespaceScheduleFire, key, scheduleFireClaimValue, olric.EX(ttl))
+	if err != nil {
+		if errors.Is(err, olric.ErrKeyFound) {
+			return ErrScheduleFireClaimed
+		}
+
+		return err
+	}
+
+	return nil
 }
 
 // buildConfig creates the Olric configuration tailored to the current
@@ -1242,6 +1344,11 @@ func (x *cluster) processRebalanceComplete(ev events.RebalanceCompleteEvent) {
 
 	x.emitPendingLeftForEpochLocked(ev.Epoch)
 	x.emitPendingJoinForEpochLocked(ev.Epoch)
+
+	// Reconcile leadership once the membership has settled for this epoch. This
+	// no-ops when the coordinator is unchanged, so join-only rebalances cost a
+	// single local membership read.
+	x.detectLeaderChangeLocked()
 }
 
 // assignJoinEpochLocked maps pending joins to the latest rebalance epoch since newer epochs
@@ -1290,6 +1397,29 @@ func (x *cluster) emitPendingLeftForEpochLocked(epoch uint64) {
 		delete(x.nodeLeftTimestamps, node)
 		delete(x.rebalanceLeftNodeEpochs, node)
 	}
+}
+
+// detectLeaderChangeLocked emits a LeaderChanged event when the cluster
+// coordinator differs from the last observed one. A transient membership-fetch
+// failure returns an empty address, which is ignored so the baseline is
+// preserved. It must be called while holding eventsLock.
+func (x *cluster) detectLeaderChangeLocked() {
+	ctx, cancel := context.WithTimeout(context.Background(), x.readTimeout)
+	defer cancel()
+
+	coordinator := x.coordinatorAddress(ctx)
+	if coordinator == "" || coordinator == x.lastCoordinatorAddr {
+		return
+	}
+
+	x.lastCoordinatorAddr = coordinator
+	x.sendEventLocked(&Event{
+		Payload: &LeaderChangedEvent{
+			Address:   coordinator,
+			Timestamp: time.Now().UTC(),
+		},
+		Type: LeaderChanged,
+	})
 }
 
 func (x *cluster) emitNodeLeftLocked(node string, timestamp int64) {
@@ -1374,12 +1504,12 @@ func (x *cluster) putGrainIfAbsent(ctx context.Context, grain *internalpb.Grain)
 	return nil
 }
 
-func (x *cluster) putRecordIfAbsent(ctx context.Context, namespace recordNamespace, key string, value []byte) error {
+func (x *cluster) putRecordIfAbsent(ctx context.Context, namespace recordNamespace, key string, value []byte, options ...olric.PutOption) error {
 	ctx = context.WithoutCancel(ctx)
 	ctx, cancel := context.WithTimeout(ctx, x.writeTimeout)
 	defer cancel()
 
-	return x.dmap.Put(ctx, composeKey(namespace, key), value, olric.NX())
+	return x.dmap.Put(ctx, composeKey(namespace, key), value, append([]olric.PutOption{olric.NX()}, options...)...)
 }
 
 func (x *cluster) putKindIfAbsent(ctx context.Context, kind string) error {

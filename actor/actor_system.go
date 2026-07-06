@@ -365,41 +365,24 @@ type ActorSystem interface {
 	//   - error: An error is returned if the cron expression is invalid or if scheduling fails due to internal errors.
 	//
 	// Note:
+	//   - In cluster mode the message is delivered exactly once per trigger tick across the
+	//     cluster, WithReference is required (the call is rejected with
+	//     ErrScheduleReferenceRequired otherwise), and the cron expression is evaluated in
+	//     UTC so every node computes the same tick instants. Outside cluster mode the
+	//     expression is evaluated in the process's local timezone.
 	//   - It's strongly recommended to set a unique reference ID using WithReference if you plan to cancel, pause, or resume the scheduled message.
 	//   - If no reference is set, an automatic one will be generated internally, which may not be easily retrievable for future operations.
 	//   - The cron expression must follow the format supported by the scheduler (typically 6 or 5 fields depending on implementation).
 	ScheduleWithCron(ctx context.Context, message any, pid *PID, cronExpression string, opts ...ScheduleOption) error
-	// RemoteScheduleWithCron schedules a message to be sent to a remote actor according to a cron expression.
+	// CancelSchedule cancels the schedule registered under the given reference, stopping any
+	// future deliveries for it.
 	//
-	// This method allows scheduling messages to remote actors using flexible cron-based timing,
-	// enabling complex recurring schedules for message delivery.
-	// Remoting must be enabled in the actor system for this method to work.
+	// In cluster mode each node runs its own copy of the schedule, so CancelSchedule only
+	// cancels the copy on the node it is called on; call it on every node that registered the
+	// schedule to stop it cluster-wide.
 	//
-	// Parameters:
-	//	  - ctx: The context for managing cancellation and deadlines.
-	//   - message: The proto.Message to be delivered according to the cron schedule.
-	//   - receiver: The address.Address of the remote actor that will receive the message.
-	//   - cronExpression: A standard cron-formatted string defining the schedule (e.g., "0 0 * * *").
-	//   - opts: Optional ScheduleOption values such as WithReference to control scheduling behavior.
-	//
-	// Returns:
-	//   - error: An error is returned if the cron expression is invalid, remoting is disabled, or scheduling fails.
-	//
-	// Note:
-	//   - Remoting must be enabled in the actor system for this functionality.
-	//   - It's strongly recommended to set a unique reference ID using WithReference if you intend to cancel, pause, or resume the scheduled message.
-	//   - If no reference is set, an automatic one will be generated internally and may not be easily retrievable.
-	//   - The cron expression must conform to the scheduler’s supported format (usually 5 or 6 fields).
-	// CancelSchedule cancels a previously scheduled message intended for delivery to a target actor (PID).
-	//
-	// It attempts to locate and cancel the scheduled task associated with the specified message reference.
-	// If the scheduled message cannot be found, has already been delivered, or was previously canceled, an error is returned.
-	//
-	// Parameters:
-	//   - reference: The message reference previously used when scheduling the message
-	//
-	// Returns:
-	//   - error: An error is returned if the scheduled message could not be found or canceled.
+	// It returns an error if no schedule is registered under the reference on this node (for
+	// example when it was never scheduled, already delivered, or already canceled).
 	CancelSchedule(reference string) error
 	// PauseSchedule pauses a previously scheduled message that was set to be delivered to a target actor (PID).
 	//
@@ -424,8 +407,7 @@ type ActorSystem interface {
 	//   - error: An error is returned if the scheduled message cannot be found, was never paused, has already been delivered, or cannot be resumed.
 	ResumeSchedule(reference string) error
 	// ListSchedules returns a read-only snapshot of every schedule currently known to the scheduler:
-	// reference, trigger kind (once/interval/cron), the cron expression or interval, the next fire time,
-	// and the target actor address.
+	// its reference and the target actor path.
 	//
 	// It has no effect on the schedules themselves. A schedule stops appearing once it has been
 	// canceled via CancelSchedule or, for one-shot schedules created via ScheduleOnce, once it has
@@ -930,9 +912,6 @@ type actorSystem struct {
 	eventsQueue     <-chan *cluster.Event
 	partitionHasher hash.Hasher
 	clusterNode     *discovery.Node
-	// lastLeaderAddr caches the last observed leader address (only touched from
-	// Start and clusterEventsLoop) so each transition publishes exactly once.
-	lastLeaderAddr string
 
 	// help protect some the fields to set
 	locker sync.RWMutex
@@ -1232,7 +1211,7 @@ func (x *actorSystem) Start(ctx context.Context) error {
 	// the one a prior teardown already closed.
 	x.shutdownSignal = make(chan types.Unit)
 
-	x.scheduler = newScheduler(x.logger, x.shutdownTimeout, x, x.schedulerJobQueue, x.schedulerJobQueueLocker)
+	x.scheduler = newSchedulerWithQueue(x.logger, x.shutdownTimeout, x, x.schedulerJobQueue, x.schedulerJobQueueLocker)
 
 	x.dispatcher.start()
 
@@ -1500,17 +1479,28 @@ func (x *actorSystem) Leader(ctx context.Context) (leader *remote.Peer, err erro
 		return nil, gerrors.ErrClusterDisabled
 	}
 
+	return x.coordinatorPeer(ctx)
+}
+
+// coordinatorPeer returns the member currently flagged as cluster coordinator
+// by the underlying engine, or nil when no single coordinator is visible (for
+// example during an election window). Unlike Leader it does not require the
+// actor system to be marked running, so it is safe to call during startup and
+// from the cluster events loop. Using the authoritative coordinator flag keeps
+// Leader, IsLeader and the LeaderChanged event consistent with one another.
+func (x *actorSystem) coordinatorPeer(ctx context.Context) (*remote.Peer, error) {
 	members, err := x.cluster.Members(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	sort.Slice(members, func(i int, j int) bool {
-		return members[i].CreatedAt < members[j].CreatedAt
-	})
+	for _, member := range members {
+		if member.Coordinator {
+			return cluster.ToRemotePeer(member), nil
+		}
+	}
 
-	leader = cluster.ToRemotePeer(members[0])
-	return leader, nil
+	return nil, nil
 }
 
 // KV returns a cluster-scoped key/value registry and distributed lock backed by the
@@ -1655,6 +1645,11 @@ func (x *actorSystem) ScheduleOnce(_ context.Context, message any, pid *PID, int
 //   - error: An error is returned if the cron expression is invalid or if scheduling fails due to internal errors.
 //
 // Note:
+//   - In cluster mode the message is delivered exactly once per trigger tick across the
+//     cluster, WithReference is required (the call is rejected with
+//     ErrScheduleReferenceRequired otherwise), and the cron expression is evaluated in UTC
+//     so every node computes the same tick instants. Outside cluster mode the expression is
+//     evaluated in the process's local timezone.
 //   - It's strongly recommended to set a unique reference ID using WithReference if you plan to cancel, pause, or resume the scheduled message.
 //   - If no reference is set, an automatic one will be generated internally, which may not be easily retrievable for future operations.
 //   - The cron expression must follow the format supported by the scheduler (typically 6 or 5 fields depending on implementation).
@@ -1662,38 +1657,15 @@ func (x *actorSystem) ScheduleWithCron(_ context.Context, message any, pid *PID,
 	return x.scheduler.ScheduleWithCron(message, pid, cronExpression, opts...)
 }
 
-// RemoteScheduleWithCron schedules a message to be sent to a remote actor according to a cron expression.
+// CancelSchedule cancels the schedule registered under the given reference, stopping any
+// future deliveries for it.
 //
-// This method allows scheduling messages to remote actors using flexible cron-based timing,
-// enabling complex recurring schedules for message delivery.
-// Remoting must be enabled in the actor system for this method to work.
+// In cluster mode each node runs its own copy of the schedule, so CancelSchedule only cancels
+// the copy on the node it is called on; call it on every node that registered the schedule to
+// stop it cluster-wide.
 //
-// Parameters:
-//   - ctx: The context for managing cancellation and deadlines.
-//   - message: The proto.Message to be delivered according to the cron schedule.
-//   - to: The address.Address of the remote actor that will receive the message.
-//   - cronExpression: A standard cron-formatted string defining the schedule (e.g., "0 0 * * *").
-//   - opts: Optional ScheduleOption values such as WithReference to control scheduling behavior.
-//
-// Returns:
-//   - error: An error is returned if the cron expression is invalid, remoting is disabled, or scheduling fails.
-//
-// Note:
-//   - Remoting must be enabled in the actor system for this functionality.
-//   - It's strongly recommended to set a unique reference ID using WithReference if you intend to cancel, pause, or resume the scheduled message.
-//   - If no reference is set, an automatic one will be generated internally and may not be easily retrievable.
-//   - The cron expression must conform to the scheduler’s supported format (usually 5 or 6 fields).
-//
-// CancelSchedule cancels a previously scheduled message intended for delivery to a target actor.
-//
-// It attempts to locate and cancel the scheduled task associated with the specified message reference.
-// If the scheduled message cannot be found, has already been delivered, or was previously canceled, an error is returned.
-//
-// Parameters:
-//   - reference: The message reference previously used when scheduling the message
-//
-// Returns:
-//   - error: An error is returned if the scheduled message could not be found or canceled.
+// It returns an error if no schedule is registered under the reference on this node (for
+// example when it was never scheduled, already delivered, or already canceled).
 func (x *actorSystem) CancelSchedule(reference string) error {
 	return x.scheduler.CancelSchedule(reference)
 }
@@ -1727,8 +1699,7 @@ func (x *actorSystem) ResumeSchedule(reference string) error {
 }
 
 // ListSchedules returns a read-only snapshot of every schedule currently known to the scheduler:
-// reference, trigger kind (once/interval/cron), the cron expression or interval, the next fire time,
-// and the target actor address.
+// its reference and the target actor path.
 //
 // It has no effect on the schedules themselves. A schedule stops appearing once it has been
 // canceled via CancelSchedule or, for one-shot schedules created via ScheduleOnce, once it has
@@ -2086,6 +2057,7 @@ func (x *actorSystem) TopicStats(ctx context.Context, topic string, timeout time
 	if !ok || stats == nil {
 		return nil, gerrors.ErrInvalidResponse
 	}
+
 	return stats, nil
 }
 
@@ -2619,9 +2591,6 @@ func (x *actorSystem) startCluster(ctx context.Context) error {
 	x.setupGrainActivationBarrier(ctx)
 
 	x.eventsQueue = x.cluster.Events()
-	// establish the initial leader baseline silently; only subsequent
-	// transitions detected from topology events are published as LeaderChanged
-	x.lastLeaderAddr = x.observedLeaderAddress(ctx)
 	x.rebalancingQueue = make(chan *internalpb.PeerState, 1)
 	go x.clusterEventsLoop()
 	// Track the replicate drainers so shutdown can wait for them to drain
@@ -3160,68 +3129,48 @@ func (x *actorSystem) resyncGrains() error {
 	return nil
 }
 
-// clusterEventsLoop listens to cluster events and send them to the event streams
+// clusterEventsLoop consumes cluster topology events, publishes them on the
+// event stream and reconciles cluster leadership. It runs in a single goroutine,
+// so the leadership state stays free of data races without locking.
 func (x *actorSystem) clusterEventsLoop() {
 	for event := range x.eventsQueue {
-		if x.isStopping() || !x.InCluster() || event == nil || event.Payload == nil {
-			continue
-		}
-
-		var message any
-		switch evt := event.Payload.(type) {
-		case *cluster.NodeJoinedEvent:
-			message = NewNodeJoined(evt.Address, evt.Timestamp)
-		case *cluster.NodeLeftEvent:
-			message = NewNodeLeft(evt.Address, evt.Timestamp)
-		default:
-			x.logger.Warnf("node=%s received unknown cluster event type=%T", x.String(), evt)
-			continue
-		}
-
-		if x.eventsStream != nil {
-			x.logger.Debugf("node=%s publishing cluster event=%s", x.String(), event.Type)
-			x.eventsStream.Publish(eventsTopic, message)
-			x.logger.Debugf("node=%s published cluster event=%s successfully", x.String(), event.Type)
-		}
-
-		switch event.Type {
-		case cluster.NodeLeft:
-			x.handleNodeLeftEvent(event)
-		case cluster.NodeJoined:
-			x.handleNodeJoinedEvent(event)
-		}
-
-		x.detectLeaderTransition()
+		x.handleClusterEvent(event)
 	}
 }
 
-// detectLeaderTransition compares the leader address observed after a topology
-// event against the last known one and publishes a LeaderChanged event exactly
-// once per transition, on every node. It is only ever invoked from
-// clusterEventsLoop, so lastLeaderAddr never races with itself.
-func (x *actorSystem) detectLeaderTransition() {
-	leaderAddr := x.observedLeaderAddress(context.Background())
-	if leaderAddr == "" || leaderAddr == x.lastLeaderAddr {
+// handleClusterEvent forwards a single cluster event to the event stream and
+// applies any side effects. Leadership changes are detected by the cluster
+// engine and arrive here as LeaderChangedEvent, so this only forwards them.
+func (x *actorSystem) handleClusterEvent(event *cluster.Event) {
+	if x.isStopping() || !x.InCluster() || event == nil || event.Payload == nil {
 		return
 	}
-	x.lastLeaderAddr = leaderAddr
+
+	var message any
+	switch evt := event.Payload.(type) {
+	case *cluster.NodeJoinedEvent:
+		message = NewNodeJoined(evt.Address, evt.Timestamp)
+	case *cluster.NodeLeftEvent:
+		message = NewNodeLeft(evt.Address, evt.Timestamp)
+	case *cluster.LeaderChangedEvent:
+		message = NewLeaderChanged(evt.Address, evt.Timestamp)
+	default:
+		x.logger.Warnf("node=%s received unknown cluster event type=%T", x.String(), evt)
+		return
+	}
 
 	if x.eventsStream != nil {
-		message := NewLeaderChanged(leaderAddr, time.Now().UTC())
-		x.logger.Debugf("node=%s publishing cluster event=LeaderChanged(leader=%s)", x.String(), leaderAddr)
+		x.logger.Debugf("node=%s publishing cluster event=%s", x.String(), event.Type)
 		x.eventsStream.Publish(eventsTopic, message)
+		x.logger.Debugf("node=%s published cluster event=%s successfully", x.String(), event.Type)
 	}
-}
 
-// observedLeaderAddress returns the current cluster coordinator's peers address,
-// or empty when it cannot be determined (engine down, membership fetch failure,
-// or no coordinator visible during a transition window).
-func (x *actorSystem) observedLeaderAddress(ctx context.Context) string {
-	leader, err := x.Leader(ctx)
-	if err != nil || leader == nil {
-		return ""
+	switch event.Type {
+	case cluster.NodeLeft:
+		x.handleNodeLeftEvent(event)
+	case cluster.NodeJoined:
+		x.handleNodeJoinedEvent(event)
 	}
-	return leader.PeersAddress()
 }
 
 // handleNodeJoinedEvent processes a NodeJoined cluster event.

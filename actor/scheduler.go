@@ -44,6 +44,33 @@ import (
 	"github.com/tochemey/goakt/v4/remote"
 )
 
+// scheduleOutdatedThreshold is how late a scheduled tick may still execute before quartz
+// drops it as outdated (see newScheduler for why the default 100ms threshold is unusable).
+const scheduleOutdatedThreshold = 24 * time.Hour
+
+// minScheduleFireClaimTTL and maxScheduleFireClaimTTL bound the derived claim TTL. The floor
+// keeps tight cron periods from producing a claim window shorter than realistic node spread;
+// the ceiling caps how long claim entries linger for very long cron periods. A tick older
+// than the claim TTL is never delivered in cluster mode (claimClusterFire skips it as stale),
+// which is what keeps a node lagging past a claim's expiry from re-winning the same tick.
+const (
+	minScheduleFireClaimTTL = time.Minute
+	maxScheduleFireClaimTTL = scheduleOutdatedThreshold
+)
+
+// scheduleFireClaimKeyFormat composes the cluster-wide claim key from the schedule reference
+// and the tick's scheduled fire time (quartz.JobMetadata.RunTime).
+const scheduleFireClaimKeyFormat = "%s@%d"
+
+// scheduleFireClaim carries the cluster-wide single-fire arbitration parameters for a cron
+// schedule registered in cluster mode. A nil *scheduleFireClaim means the schedule never
+// claims and always fires locally (every non-cron schedule, and every cron schedule outside
+// cluster mode).
+type scheduleFireClaim struct {
+	reference string
+	ttl       time.Duration
+}
+
 // scheduler defines the Go-Akt scheduler.
 // Its job is to help stack messages that will be delivered in the future to actors.
 type scheduler struct {
@@ -64,22 +91,38 @@ type scheduler struct {
 	// actorSystem is needed to resolve NoSender() for remote-PID schedules,
 	// since remote PIDs carry no actor-system reference.
 	actorSystem ActorSystem
-	// persistent is true when jobQueue was supplied via WithSchedulerJobQueue.
-	// It switches ScheduleOnce/Schedule/ScheduleWithCron from wrapping a
-	// non-serializable closure to persisting a ScheduledMessage envelope, and
-	// makes Start rebuild scheduledKeys from whatever the queue already holds.
+	// persistent is true when a JobQueue was supplied via WithSchedulerJobQueue: schedules
+	// persist as ScheduledMessage envelopes and Start rebuilds bookkeeping from the queue.
 	persistent bool
-	// fireClaims tracks, per reference, the most recent cluster schedule-fire claim key
-	// attempted so CancelSchedule/Stop can remove it instead of waiting out its TTL; claims
-	// are attempted from quartz's own goroutines, hence the concurrency-safe map.
-	fireClaims *xsync.Map[string, string]
 }
 
-// newScheduler creates an instance of scheduler. jobQueue and queueLocker are
-// optional (see WithSchedulerJobQueue); when either is nil the scheduler keeps
-// go-quartz's default in-memory queue and behaves exactly as before this
-// option existed.
-func newScheduler(logger log.Logger, shutdownTimeout time.Duration, system ActorSystem, jobQueue quartz.JobQueue, queueLocker sync.Locker) *scheduler {
+// ScheduleInfo is a read-only snapshot describing a single scheduled message known to the scheduler.
+//
+// It is returned by ListSchedules and is meant for observability/admin tooling (dashboards, operational
+// debugging, etc.). Mutating the schedule (cancel/pause/resume) still goes through the existing
+// reference-based APIs; ScheduleInfo only reports what those APIs would otherwise operate on blindly.
+type ScheduleInfo struct {
+	// Reference is the schedule reference, either user-supplied via WithReference or auto-generated.
+	Reference string
+	// Path is the target actor path the message will be delivered to.
+	Path Path
+}
+
+// scheduleMeta captures what the underlying quartz job cannot report back on its own: the
+// delivery target's path. The quartz scheduled job itself remains the source of truth for
+// whether the schedule still exists.
+type scheduleMeta struct {
+	path Path
+}
+
+// newScheduler creates an instance of scheduler
+func newScheduler(logger log.Logger, shutdownTimeout time.Duration, system ActorSystem) *scheduler {
+	return newSchedulerWithQueue(logger, shutdownTimeout, system, nil, nil)
+}
+
+// newSchedulerWithQueue creates a scheduler backed by a persistent go-quartz JobQueue (see
+// WithSchedulerJobQueue). With a nil queue or locker it behaves exactly like newScheduler.
+func newSchedulerWithQueue(logger log.Logger, shutdownTimeout time.Duration, system ActorSystem, jobQueue quartz.JobQueue, queueLocker sync.Locker) *scheduler {
 	// create an instance of quartz scheduler with logger off
 	// Set a high OutdatedThreshold to prevent RunOnceTrigger jobs from being
 	// silently dropped when they become "outdated" (scheduled time passed).
@@ -94,15 +137,13 @@ func newScheduler(logger log.Logger, shutdownTimeout time.Duration, system Actor
 	// invocation, which would drift across nodes.
 	opts := []quartz.SchedulerOpt{
 		quartz.WithLogger(quartzlogger.NewSimpleLogger(nil, quartzlogger.LevelOff)),
-		quartz.WithOutdatedThreshold(24 * time.Hour),
+		quartz.WithOutdatedThreshold(scheduleOutdatedThreshold),
 		quartz.WithJobMetadata(),
 	}
-
 	persistent := jobQueue != nil && queueLocker != nil
 	if persistent {
 		opts = append(opts, quartz.WithQueue(jobQueue, queueLocker))
 	}
-
 	quartzScheduler, _ := quartz.NewStdScheduler(opts...)
 
 	// create an instance of scheduler
@@ -116,7 +157,6 @@ func newScheduler(logger log.Logger, shutdownTimeout time.Duration, system Actor
 		scheduledMeta:   xsync.NewMap[string, *scheduleMeta](),
 		actorSystem:     system,
 		persistent:      persistent,
-		fireClaims:      xsync.NewMap[string, string](),
 	}
 
 	// return the instance of the scheduler
@@ -136,43 +176,6 @@ func (x *scheduler) Start(ctx context.Context) {
 	x.logger.Info("messages scheduler started.:)")
 }
 
-// rebuildScheduledKeys repopulates scheduledKeys from whatever the persistent
-// JobQueue already holds. This is what lets schedules created by a previous
-// process instance (and restored into the queue by its implementation) become
-// manageable again via CancelSchedule/PauseSchedule/ResumeSchedule after a
-// restart.
-func (x *scheduler) rebuildScheduledKeys() {
-	jobKeys, err := x.quartzScheduler.GetJobKeys()
-	if err != nil {
-		x.logger.Error(fmt.Errorf("failed to list persisted scheduled jobs: %w", err))
-		return
-	}
-
-	for _, jobKey := range jobKeys {
-		scheduledJob, err := x.quartzScheduler.GetScheduledJob(jobKey)
-		if err != nil {
-			x.logger.Error(fmt.Errorf("failed to load persisted job key=%s: %w", jobKey.String(), err))
-			continue
-		}
-
-		msgJob, ok := scheduledJob.JobDetail().Job().(*scheduledMessageJob)
-		if !ok {
-			continue
-		}
-
-		x.scheduledKeys.Set(msgJob.envelope.GetReference(), jobKey)
-		// without this, ListSchedules reports nothing for schedules that survived a restart
-		x.recordSchedule(msgJob.envelope.GetReference(), scheduleMetaFromEnvelope(msgJob.envelope))
-	}
-}
-
-// scheduleMetaFromEnvelope rebuilds the introspection metadata for a schedule restored
-// from a persistent JobQueue. The envelope only carries the target's name (resolution
-// happens by name at fire time), so Path is that name rather than a full path.
-func scheduleMetaFromEnvelope(envelope *internalpb.ScheduledMessage) *scheduleMeta {
-	return &scheduleMeta{path: envelope.GetTargetName()}
-}
-
 // Stop stops the scheduler
 func (x *scheduler) Stop(ctx context.Context) {
 	if !x.started.Load() {
@@ -182,11 +185,8 @@ func (x *scheduler) Stop(ctx context.Context) {
 	x.logger.Info("stopping messages scheduler...")
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	// With a persistent JobQueue, pending jobs must survive Stop so Start can
-	// rebuild scheduledKeys from them again; Clear would erase the whole point
-	// of configuring a durable queue. With the default in-memory queue, Clear
-	// keeps prior behavior of dropping everything on Stop.
 	if !x.persistent {
+		// a persistent queue must survive Stop so a restart can rebuild from it
 		_ = x.quartzScheduler.Clear()
 	}
 	x.quartzScheduler.Stop()
@@ -196,7 +196,6 @@ func (x *scheduler) Stop(ctx context.Context) {
 	defer cancel()
 	x.quartzScheduler.Wait(ctx)
 
-	x.removeAllFireClaims(ctx)
 	x.scheduledKeys.Reset()
 	x.scheduledMeta.Reset()
 	x.logger.Info("messages scheduler stopped...:)")
@@ -234,7 +233,6 @@ func (x *scheduler) ScheduleOnce(message any, to *PID, delay time.Duration, opts
 	senderConfig := newScheduleConfig(opts...)
 	reference := senderConfig.Reference()
 	jobKey := quartz.NewJobKey(reference)
-	x.recordSchedule(reference, &scheduleMeta{path: to.Path().String()})
 
 	triggerSpec := &internalpb.ScheduleTrigger{
 		Kind: &internalpb.ScheduleTrigger_Once{Once: &internalpb.OnceTrigger{Delay: durationpb.New(delay)}},
@@ -246,6 +244,7 @@ func (x *scheduler) ScheduleOnce(message any, to *PID, delay time.Duration, opts
 	}
 
 	x.scheduledKeys.Set(reference, jobKey)
+	x.recordSchedule(reference, &scheduleMeta{path: to.Path()})
 	return x.quartzScheduler.ScheduleJob(detail, quartz.NewRunOnceTrigger(delay))
 }
 
@@ -282,7 +281,6 @@ func (x *scheduler) Schedule(message any, to *PID, interval time.Duration, opts 
 	senderConfig := newScheduleConfig(opts...)
 	reference := senderConfig.Reference()
 	jobKey := quartz.NewJobKey(reference)
-	x.recordSchedule(reference, &scheduleMeta{path: to.Path().String()})
 
 	triggerSpec := &internalpb.ScheduleTrigger{
 		Kind: &internalpb.ScheduleTrigger_Interval{Interval: &internalpb.IntervalTrigger{Interval: durationpb.New(interval)}},
@@ -294,6 +292,7 @@ func (x *scheduler) Schedule(message any, to *PID, interval time.Duration, opts 
 	}
 
 	x.scheduledKeys.Set(reference, jobKey)
+	x.recordSchedule(reference, &scheduleMeta{path: to.Path()})
 	return x.quartzScheduler.ScheduleJob(detail, quartz.NewSimpleTrigger(interval))
 }
 
@@ -312,6 +311,10 @@ func (x *scheduler) Schedule(message any, to *PID, interval time.Duration, opts 
 //   - error: An error is returned if the cron expression is invalid or if scheduling fails due to internal errors.
 //
 // Note:
+//   - In cluster mode the message is delivered exactly once per trigger tick across the
+//     cluster, WithReference is required (ErrScheduleReferenceRequired otherwise), and the
+//     cron expression is evaluated in UTC so every node computes the same tick instants.
+//     Outside cluster mode the expression is evaluated in the process's local timezone.
 //   - It's strongly recommended to set a unique reference ID using WithReference if you plan to cancel, pause, or resume the scheduled message.
 //   - If no reference is set, an automatic one will be generated internally, which may not be easily retrievable for future operations.
 //   - The cron expression must follow the format supported by the scheduler (typically 6 or 5 fields depending on implementation).
@@ -327,26 +330,38 @@ func (x *scheduler) ScheduleWithCron(message any, to *PID, cronExpression string
 		return errors.ErrRemotingDisabled
 	}
 
-	senderConfig := newScheduleConfig(opts...)
+	// The cluster engine is wired before the scheduler starts, so gate on it rather than on
+	// InCluster(): the latter also requires the actor system's started flag, which is set
+	// after the scheduler starts, and a call racing ActorSystem.Start would otherwise
+	// register a permanently claim-free schedule.
+	inCluster := x.actorSystem.getCluster() != nil
 
+	// In cluster mode the cron expression is evaluated in UTC so every node computes the
+	// same tick instants: the fire claim is keyed on the tick's fire time, and
+	// location-dependent fire times (e.g. "0 0 9 * * *" on mixed-timezone nodes) would give
+	// each timezone group its own key and deliver once per group instead of once per cluster.
 	location := time.Now().Location()
+	if inCluster {
+		location = time.UTC
+	}
+
 	trigger, err := quartz.NewCronTriggerWithLoc(cronExpression, location)
 	if err != nil {
 		x.logger.Error(fmt.Errorf("failed to schedule message: %w", err))
 		return err
 	}
 
+	senderConfig := newScheduleConfig(opts...)
+
 	var claim *scheduleFireClaim
-	if x.actorSystem.InCluster() {
+	if inCluster {
 		// Interval/one-shot RunTimes are anchored to each node's local registration clock and
 		// never align cluster-wide, so single fire is cron-only: a cron trigger's next fire
 		// time is wall-clock deterministic, which is what makes cross-node arbitration meaningful.
 		if !senderConfig.hasExplicitReference() {
 			return errors.ErrScheduleReferenceRequired
 		}
-		if !cluster.SupportsScheduleFireClaim(x.actorSystem.getCluster()) {
-			return errors.ErrSingleFireUnsupported
-		}
+
 		claim = &scheduleFireClaim{
 			reference: senderConfig.Reference(),
 			ttl:       cronClaimTTL(trigger),
@@ -355,7 +370,6 @@ func (x *scheduler) ScheduleWithCron(message any, to *PID, cronExpression string
 
 	reference := senderConfig.Reference()
 	jobKey := quartz.NewJobKey(reference)
-	x.recordSchedule(reference, &scheduleMeta{path: to.Path().String()})
 
 	triggerSpec := &internalpb.ScheduleTrigger{
 		Kind: &internalpb.ScheduleTrigger_Cron{Cron: &internalpb.CronTrigger{Expression: cronExpression, Timezone: location.String()}},
@@ -366,6 +380,7 @@ func (x *scheduler) ScheduleWithCron(message any, to *PID, cronExpression string
 	}
 
 	x.scheduledKeys.Set(reference, jobKey)
+	x.recordSchedule(reference, &scheduleMeta{path: to.Path()})
 	return x.quartzScheduler.ScheduleJob(detail, trigger)
 }
 
@@ -385,7 +400,6 @@ func (x *scheduler) CancelSchedule(reference string) error {
 
 	defer x.scheduledKeys.Delete(reference)
 	defer x.scheduledMeta.Delete(reference)
-	defer x.cleanupFireClaim(reference)
 
 	if !x.started.Load() {
 		return errors.ErrSchedulerNotStarted
@@ -451,39 +465,61 @@ func (x *scheduler) ResumeSchedule(reference string) error {
 	return x.quartzScheduler.ResumeJob(jobKey)
 }
 
-// scheduleFireClaim carries the cluster-wide single-fire arbitration parameters for a cron
-// schedule registered in cluster mode. A nil *scheduleFireClaim means the schedule never
-// claims and always fires locally (every non-cron schedule, and every cron schedule outside
-// cluster mode).
-type scheduleFireClaim struct {
-	reference string
-	ttl       time.Duration
+// ListSchedules returns a snapshot of every schedule currently known to the scheduler:
+// its reference and the target actor path.
+//
+// It is purely read-only and has no effect on the schedules themselves. A schedule stops appearing
+// once it has been canceled (CancelSchedule) or, for one-shot schedules created via ScheduleOnce,
+// once it has fired and been delivered.
+//
+// Returns an empty slice when the scheduler has not started or when nothing is currently scheduled.
+func (x *scheduler) ListSchedules() []ScheduleInfo {
+	if !x.started.Load() {
+		return []ScheduleInfo{}
+	}
+
+	infos := make([]ScheduleInfo, 0, x.scheduledMeta.Len())
+	x.scheduledMeta.Range(func(reference string, meta *scheduleMeta) {
+		jobKey, ok := x.scheduledKeys.Get(reference)
+		if !ok {
+			return
+		}
+
+		if _, err := x.quartzScheduler.GetScheduledJob(jobKey); err != nil {
+			// only job-not-found means the schedule legitimately ended (fired one-shot or a
+			// removal path that skipped scheduledMeta); anything else is unexpected and logged
+			if !stderrors.Is(err, quartz.ErrJobNotFound) {
+				x.logger.Warnf("failed to look up scheduled job reference=%s: %v", reference, err)
+			}
+			return
+		}
+
+		infos = append(infos, ScheduleInfo{
+			Reference: reference,
+			Path:      meta.path,
+		})
+	})
+
+	return infos
 }
 
-// minScheduleFireClaimTTL and maxScheduleFireClaimTTL bound the derived TTL so an unusually
-// tight or loose cron period can't produce a claim window that is impractically short (churns
-// the cluster store every tick) or long (masks a crashed node for too long).
-const (
-	minScheduleFireClaimTTL = time.Minute
-	maxScheduleFireClaimTTL = time.Hour
-)
+// recordSchedule stores the introspection metadata for a newly created schedule.
+// Called by ScheduleOnce, Schedule and ScheduleWithCron right after the job key is registered.
+func (x *scheduler) recordSchedule(reference string, meta *scheduleMeta) {
+	x.scheduledMeta.Set(reference, meta)
+}
 
 // cronClaimTTL derives the cluster schedule-fire claim TTL from the gap between two
 // consecutive fire times of trigger, clamped to [minScheduleFireClaimTTL, maxScheduleFireClaimTTL].
-//
-// Correctness requires ttl to exceed the worst-case spread between nodes handling the same
-// tick: nodes racing for a tick that observe it up to ttl apart still arbitrate against the
-// same key, so scaling the TTL to at least the cron period is what makes the claim safe, not
-// merely a garbage-collection nicety. With ttl >= the period, a node lagging beyond that is
-// indistinguishable from having missed the tick and moved on to the next one, so clamping the
-// derived value to the range above never harms correctness, only how quickly a stale claim
-// is forgotten.
+// The TTL must cover the worst-case lag between nodes handling the same tick; see
+// cluster.ClaimScheduleFire.
 func cronClaimTTL(trigger quartz.Trigger) time.Duration {
 	now := quartz.NowNano()
 	first, err := trigger.NextFireTime(now)
 	if err != nil {
 		return minScheduleFireClaimTTL
 	}
+
 	second, err := trigger.NextFireTime(first)
 	if err != nil {
 		return minScheduleFireClaimTTL
@@ -510,12 +546,17 @@ func (x *scheduler) makeJobFn(to *PID, message any, cfg *scheduleConfig, claim *
 	if sender == nil || sender.Equals(noSender) {
 		sender = noSender
 	}
+
 	return func(ctx context.Context) (bool, error) {
 		if claim != nil {
 			won, err := x.claimClusterFire(ctx, claim)
 			if err != nil {
+				// quartz runs job functions with logging disabled and no retries, so this is
+				// the only place a claim failure becomes observable.
+				x.logger.Warnf("failed to claim cron tick for schedule=(%s): %v", claim.reference, err)
 				return false, err
 			}
+
 			if !won {
 				// Another node already claimed this tick: skip delivery silently.
 				return true, nil
@@ -527,11 +568,52 @@ func (x *scheduler) makeJobFn(to *PID, message any, cfg *scheduleConfig, claim *
 	}
 }
 
-// buildJobDetail returns the quartz.JobDetail to schedule for to/message/cfg.
-// When no persistent JobQueue is configured, it wraps a plain closure exactly
-// as before this option existed. When a persistent JobQueue is configured, it
-// instead builds a ScheduledMessage envelope and wraps it in a
-// scheduledMessageJob, so the job can be persisted and rebuilt after a restart.
+// claimClusterFire arbitrates which node is allowed to deliver the current trigger tick of a
+// cron schedule running in cluster mode. It returns true for the caller that should proceed
+// with delivery, and false for every other node racing for the same tick. Claim entries are
+// reclaimed by their TTL alone; a canceled schedule or a stopping node never deletes them,
+// since the entry may be the winning claim other nodes are still arbitrating against.
+//
+// A tick older than the claim TTL is skipped without claiming: quartz replays missed ticks
+// for up to scheduleOutdatedThreshold, so a node lagging past the TTL would otherwise find
+// the winner's expired claim and deliver the tick a second time. Skipping keeps the
+// at-most-once-per-tick guarantee at the cost of never delivering a tick that every node
+// missed for longer than the TTL.
+//
+// If the tick's scheduled fire time is unavailable, it fails open (returns true) rather than
+// silently dropping every delivery cluster-wide.
+func (x *scheduler) claimClusterFire(ctx context.Context, claim *scheduleFireClaim) (bool, error) {
+	metadata, ok := ctx.Value(quartz.JobMetadataContextKey).(quartz.JobMetadata)
+	if !ok {
+		return true, nil
+	}
+
+	if lag := time.Since(time.Unix(0, metadata.RunTime)); lag > claim.ttl {
+		x.logger.Warnf("skipping stale cron tick for schedule=(%s): tick is %s late, claim ttl is %s", claim.reference, lag, claim.ttl)
+		return false, nil
+	}
+
+	cl := x.actorSystem.getCluster()
+	if cl == nil {
+		return false, errors.ErrClusterDisabled
+	}
+
+	key := fmt.Sprintf(scheduleFireClaimKeyFormat, claim.reference, metadata.RunTime)
+	err := cl.ClaimScheduleFire(ctx, key, claim.ttl)
+	switch {
+	case err == nil:
+		return true, nil
+	case stderrors.Is(err, cluster.ErrScheduleFireClaimed):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+// buildJobDetail returns the quartz.JobDetail to schedule for to/message/cfg. Without a
+// persistent JobQueue it wraps a plain closure exactly as before; with one it persists a
+// ScheduledMessage envelope wrapped in a scheduledMessageJob so the job can be rebuilt
+// after a restart.
 func (x *scheduler) buildJobDetail(to *PID, message any, cfg *scheduleConfig, jobKey *quartz.JobKey, triggerSpec *internalpb.ScheduleTrigger, claim *scheduleFireClaim) (*quartz.JobDetail, error) {
 	if !x.persistent {
 		jobFn := x.makeJobFn(to, message, cfg, claim)
@@ -575,41 +657,55 @@ func (x *scheduler) buildEnvelope(to *PID, message any, cfg *scheduleConfig, tri
 	return envelope, nil
 }
 
-// claimClusterFire arbitrates which node is allowed to deliver the current trigger tick of a
-// cron schedule running in cluster mode. It returns true for the caller that should proceed
-// with delivery, and false for every other node racing for the same tick.
-//
-// It records the attempted key in fireClaims before racing for it, so CancelSchedule/Stop can
-// remove it later regardless of whether this node wins or loses the race.
-//
-// If the tick's scheduled fire time is unavailable, it fails open (returns true) rather than
-// silently dropping every delivery cluster-wide; TestSchedulerJobMetadataPresent pins that
-// go-quartz keeps this metadata available so this fallback stays dormant in practice.
-func (x *scheduler) claimClusterFire(ctx context.Context, claim *scheduleFireClaim) (bool, error) {
-	metadata, ok := ctx.Value(quartz.JobMetadataContextKey).(quartz.JobMetadata)
-	if !ok {
-		return true, nil
+// rebuildScheduledKeys repopulates scheduledKeys and the introspection metadata from
+// whatever the persistent JobQueue already holds, so schedules created by a previous
+// process instance become manageable and listable again after a restart.
+func (x *scheduler) rebuildScheduledKeys() {
+	jobKeys, err := x.quartzScheduler.GetJobKeys()
+	if err != nil {
+		x.logger.Error(fmt.Errorf("failed to list persisted scheduled jobs: %w", err))
+		return
 	}
 
-	key := fmt.Sprintf("%s@%d", claim.reference, metadata.RunTime)
-	x.fireClaims.Set(claim.reference, key)
+	for _, jobKey := range jobKeys {
+		scheduledJob, err := x.quartzScheduler.GetScheduledJob(jobKey)
+		if err != nil {
+			x.logger.Error(fmt.Errorf("failed to load persisted job key=%s: %w", jobKey.String(), err))
+			continue
+		}
 
-	err := cluster.ClaimScheduleFire(ctx, x.actorSystem.getCluster(), key, claim.ttl)
-	switch {
-	case err == nil:
-		return true, nil
-	case stderrors.Is(err, cluster.ErrScheduleFireClaimed):
-		return false, nil
-	default:
-		return false, err
+		msgJob, ok := scheduledJob.JobDetail().Job().(*scheduledMessageJob)
+		if !ok {
+			continue
+		}
+
+		x.scheduledKeys.Set(msgJob.envelope.GetReference(), jobKey)
+		// without this, ListSchedules reports nothing for schedules that survived a restart
+		x.recordSchedule(msgJob.envelope.GetReference(), &scheduleMeta{path: envelopePath{name: msgJob.envelope.GetTargetName()}})
 	}
 }
+
+// envelopePath is the minimal Path a schedule restored from a persistent JobQueue can
+// report: the envelope only carries the target's name (resolution happens by name at fire
+// time), so every other component is empty.
+type envelopePath struct{ name string }
+
+var _ Path = envelopePath{}
+
+func (p envelopePath) Host() string           { return "" }
+func (p envelopePath) HostPort() string       { return "" }
+func (p envelopePath) Port() int              { return 0 }
+func (p envelopePath) Name() string           { return p.name }
+func (p envelopePath) Parent() Path           { return nil }
+func (p envelopePath) String() string         { return p.name }
+func (p envelopePath) System() string         { return "" }
+func (p envelopePath) Equals(other Path) bool { return other != nil && p.String() == other.String() }
 
 // claimScheduleFireTick is the persistent-path twin of claimClusterFire: schedules rebuilt
-// from a JobQueue after a restart arbitrate through it (untracked, so their claim keys rely
-// on the TTL backstop rather than CancelSchedule/Stop cleanup).
+// from a JobQueue after a restart arbitrate through it.
 func claimScheduleFireTick(ctx context.Context, system ActorSystem, reference string, ttl time.Duration) (bool, error) {
-	if !system.InCluster() {
+	cl := system.getCluster()
+	if cl == nil {
 		return true, nil
 	}
 
@@ -618,8 +714,8 @@ func claimScheduleFireTick(ctx context.Context, system ActorSystem, reference st
 		return true, nil
 	}
 
-	key := fmt.Sprintf("%s@%d", reference, metadata.RunTime)
-	err := cluster.ClaimScheduleFire(ctx, system.getCluster(), key, ttl)
+	key := fmt.Sprintf(scheduleFireClaimKeyFormat, reference, metadata.RunTime)
+	err := cl.ClaimScheduleFire(ctx, key, ttl)
 	switch {
 	case err == nil:
 		return true, nil
@@ -628,35 +724,4 @@ func claimScheduleFireTick(ctx context.Context, system ActorSystem, reference st
 	default:
 		return false, err
 	}
-}
-
-// cleanupFireClaim best-effort removes the most recent schedule-fire claim key attempted for
-// reference so a canceled cron schedule doesn't leave a claim to linger in the cluster store
-// until its TTL expires.
-func (x *scheduler) cleanupFireClaim(reference string) {
-	key, ok := x.fireClaims.Get(reference)
-	if !ok {
-		return
-	}
-	x.fireClaims.Delete(reference)
-
-	if err := cluster.RemoveScheduleFire(context.Background(), x.actorSystem.getCluster(), key); err != nil {
-		x.logger.Warnf("failed to remove schedule-fire claim %s: %v", key, err)
-	}
-}
-
-// removeAllFireClaims best-effort removes every tracked schedule-fire claim key on scheduler
-// shutdown, backstopped by each claim's own TTL for anything this misses (e.g. a claim
-// attempted after this loop already read the map).
-func (x *scheduler) removeAllFireClaims(ctx context.Context) {
-	if x.fireClaims.Len() == 0 {
-		return
-	}
-	cl := x.actorSystem.getCluster()
-	x.fireClaims.Range(func(_ string, key string) {
-		if err := cluster.RemoveScheduleFire(ctx, cl, key); err != nil {
-			x.logger.Warnf("failed to remove schedule-fire claim %s: %v", key, err)
-		}
-	})
-	x.fireClaims.Reset()
 }

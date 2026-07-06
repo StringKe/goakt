@@ -52,6 +52,9 @@ var (
 	// ErrLockNotHeld is returned when Unlock is called for a lock that is no longer held,
 	// for example because it already expired or was already released.
 	ErrLockNotHeld = errors.New("lock not held")
+	// ErrScheduleFireClaimed is returned by ClaimScheduleFire when another node has already
+	// won the race for the given key.
+	ErrScheduleFireClaimed = errors.New("schedule fire already claimed")
 )
 
 // IsQuorumError returns true when a cluster operation failed due to quorum constraints.

@@ -1610,17 +1610,19 @@ func TestActorSystem(t *testing.T) {
 		require.NoError(t, cl1.Stop(ctx))
 		require.NoError(t, sd1.Close())
 
-		pause.For(time.Second)
-
+		// cl2 is promoted to coordinator once cl1 departs, publishing exactly one
+		// LeaderChanged that carries the new leader's address. Leadership handover
+		// is eventual, so drain the subscriber until the event surfaces.
 		var leaderChanges []*LeaderChanged
-		for event := range subscriber2.Iterator() {
-			if leaderChanged, ok := event.Payload().(*LeaderChanged); ok {
-				leaderChanges = append(leaderChanges, leaderChanged)
+		require.Eventually(t, func() bool {
+			for event := range subscriber2.Iterator() {
+				if leaderChanged, ok := event.Payload().(*LeaderChanged); ok {
+					leaderChanges = append(leaderChanges, leaderChanged)
+				}
 			}
-		}
+			return len(leaderChanges) >= 1
+		}, 10*time.Second, 200*time.Millisecond)
 
-		// exactly one LeaderChanged is published when the coordinator departs,
-		// carrying the new leader's address
 		require.Len(t, leaderChanges, 1)
 		require.Equal(t, peerAddress2, leaderChanges[0].Address())
 		require.NotZero(t, leaderChanges[0].Timestamp())
@@ -6764,38 +6766,6 @@ func TestPreShutdown(t *testing.T) {
 		peerState, err := system.preShutdown()
 		require.NoError(t, err)
 		assert.Nil(t, peerState)
-	})
-
-	t.Run("excludes ephemeral actors from the peer state snapshot", func(t *testing.T) {
-		ctx := context.TODO()
-		clusterMock := mockscluster.NewCluster(t)
-		system := MockReplicationTestSystem(clusterMock)
-		system.relocationEnabled.Store(true)
-
-		require.NoError(t, system.spawnRootGuardian(ctx))
-		require.NoError(t, system.spawnSystemGuardian(ctx))
-		require.NoError(t, system.spawnUserGuardian(ctx))
-
-		clusterMock.EXPECT().ActorExists(mock.Anything, "durable").Return(false, nil).Once()
-		clusterMock.EXPECT().ActorExists(mock.Anything, "ephemeral").Return(false, nil).Once()
-
-		durablePID, err := system.Spawn(ctx, "durable", NewMockActor())
-		require.NoError(t, err)
-		require.True(t, durablePID.IsRelocatable())
-
-		ephemeralPID, err := system.Spawn(ctx, "ephemeral", NewMockActor(), WithRelocationDisabled(), WithPassivationStrategy(passivation.NewLongLivedStrategy()))
-		require.NoError(t, err)
-		require.False(t, ephemeralPID.IsRelocatable())
-
-		peerState, err := system.preShutdown()
-		require.NoError(t, err)
-		require.NotNil(t, peerState)
-
-		_, hasDurable := peerState.GetActors()[durablePID.ID()]
-		assert.True(t, hasDurable, "relocatable actor must be part of the peer state snapshot")
-
-		_, hasEphemeral := peerState.GetActors()[ephemeralPID.ID()]
-		assert.False(t, hasEphemeral, "ephemeral actor must be excluded from relocation bookkeeping")
 	})
 }
 

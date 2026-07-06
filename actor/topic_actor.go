@@ -262,8 +262,11 @@ func (x *topicActor) sendToRemoteTopicActors(cctx context.Context, remotePeers [
 }
 
 // localSubscriberCount returns the number of still-alive local subscribers of
-// topic, pruning any that have terminated without going through
-// handleTerminated (e.g. a stale entry left by a race with Watch).
+// topic. It skips subscribers that have terminated without going through
+// handleTerminated yet (e.g. a stale entry left by a race with Watch), so the
+// count matches what a publish would actually deliver to. It does not mutate
+// the registry: pruning stale entries is left to the publish and Terminated
+// paths.
 func (x *topicActor) localSubscriberCount(topic string) int32 {
 	subscribers, ok := x.topics.Get(topic)
 	if !ok {
@@ -272,14 +275,11 @@ func (x *topicActor) localSubscriberCount(topic string) int32 {
 
 	var count int32
 	for _, subscriber := range subscribers.Values() {
-		_, exists := x.actorSystem.tree().node(subscriber.ID())
-		if exists && subscriber.IsRunning() {
+		if _, exists := x.actorSystem.tree().node(subscriber.ID()); exists && subscriber.IsRunning() {
 			count++
-			continue
 		}
-		// remove the subscriber if it does not exist
-		subscribers.Delete(subscriber.ID())
 	}
+
 	return count
 }
 
@@ -303,8 +303,10 @@ func (x *topicActor) handleGetTopicStats(ctx *ReceiveContext) {
 	}
 
 	local := x.localSubscriberCount(query.topic)
-	instances := 0
+
+	var instances int32
 	if local > 0 {
+		// count this node when it has any local subscribers
 		instances = 1
 	}
 
@@ -321,14 +323,11 @@ func (x *topicActor) handleGetTopicStats(ctx *ReceiveContext) {
 			ctx.Err(errors.NewInternalError(err))
 			return
 		}
-		instances += int(remoteInstances)
+
+		instances += remoteInstances
 	}
 
-	ctx.Response(&TopicStats{
-		Topic:                query.topic,
-		LocalSubscriberCount: int(local),
-		TopicInstanceCount:   instances,
-	})
+	ctx.Response(NewTopicStats(query.topic, local, instances))
 }
 
 // queryRemotePeerInstanceCount asks every remote peer's topic actor for its
@@ -343,7 +342,7 @@ func (x *topicActor) queryRemotePeerInstanceCount(cctx context.Context, remotePe
 	actorName := reservedName(topicActorType)
 	from := pathToAddress(x.pid.Path())
 
-	var instances atomic.Int32
+	var numInstances atomic.Int32
 	eg, egCtx := errgroup.WithContext(cctx)
 	for _, peer := range remotePeers {
 		eg.Go(func() error {
@@ -358,8 +357,9 @@ func (x *topicActor) queryRemotePeerInstanceCount(cctx context.Context, remotePe
 			}
 
 			if stats, ok := resp.(*internalpb.TopicStatsResponse); ok && stats.GetLocalSubscriberCount() > 0 {
-				instances.Inc()
+				numInstances.Inc()
 			}
+
 			return nil
 		})
 	}
@@ -367,7 +367,8 @@ func (x *topicActor) queryRemotePeerInstanceCount(cctx context.Context, remotePe
 	if err := eg.Wait(); err != nil {
 		return 0, err
 	}
-	return instances.Load(), nil
+
+	return numInstances.Load(), nil
 }
 
 // handleTerminated handles Terminated message

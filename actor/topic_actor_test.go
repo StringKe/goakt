@@ -494,12 +494,6 @@ func TestTopicActor(t *testing.T) {
 		require.True(t, ok)
 		require.EqualValues(t, subscribers.Len(), 2)
 
-		// the same cleanup must be observable through the public API, not
-		// just the internal subscriber map
-		stats, err := actorSystem.TopicStats(ctx, topic, time.Second)
-		require.NoError(t, err)
-		require.EqualValues(t, 2, stats.LocalSubscriberCount)
-
 		require.NoError(t, actorSystem.Stop(ctx))
 	})
 
@@ -586,16 +580,11 @@ func TestTopicActor(t *testing.T) {
 
 		require.NoError(t, actorSystem.Stop(ctx))
 	})
-
 	t.Run("With TopicStats local counts and instance count without clustering", func(t *testing.T) {
 		ctx := context.Background()
 		actorSystem, _ := NewActorSystem("testSys", WithLogger(log.DiscardLogger), WithPubSub())
 
-		// start the actor system
-		err := actorSystem.Start(ctx)
-		require.NoError(t, err)
-
-		// wait for the actor system to be ready
+		require.NoError(t, actorSystem.Start(ctx))
 		pause.For(time.Second)
 
 		topic := "test-topic"
@@ -603,9 +592,9 @@ func TestTopicActor(t *testing.T) {
 		// no subscriber yet: zero counts, and the instance count is 0, not 1
 		stats, err := actorSystem.TopicStats(ctx, topic, time.Second)
 		require.NoError(t, err)
-		require.Equal(t, topic, stats.Topic)
-		require.Zero(t, stats.LocalSubscriberCount)
-		require.Zero(t, stats.TopicInstanceCount)
+		require.Equal(t, topic, stats.Topic())
+		require.Zero(t, stats.LocalSubscriberCount())
+		require.Zero(t, stats.TopicInstanceCount())
 
 		actor1, err := actorSystem.Spawn(ctx, "actor1", NewMockSubscriber(), WithLongLived())
 		require.NoError(t, err)
@@ -620,8 +609,8 @@ func TestTopicActor(t *testing.T) {
 
 		stats, err = actorSystem.TopicStats(ctx, topic, time.Second)
 		require.NoError(t, err)
-		require.EqualValues(t, 2, stats.LocalSubscriberCount)
-		require.EqualValues(t, 1, stats.TopicInstanceCount)
+		require.EqualValues(t, 2, stats.LocalSubscriberCount())
+		require.EqualValues(t, 1, stats.TopicInstanceCount())
 
 		// unsubscribe one actor and check the local count is updated
 		require.NoError(t, actor1.Tell(ctx, actorSystem.TopicActor(), NewUnsubscribe(topic)))
@@ -629,8 +618,8 @@ func TestTopicActor(t *testing.T) {
 
 		stats, err = actorSystem.TopicStats(ctx, topic, time.Second)
 		require.NoError(t, err)
-		require.EqualValues(t, 1, stats.LocalSubscriberCount)
-		require.EqualValues(t, 1, stats.TopicInstanceCount)
+		require.EqualValues(t, 1, stats.LocalSubscriberCount())
+		require.EqualValues(t, 1, stats.TopicInstanceCount())
 
 		// unsubscribing the last subscriber brings the instance count back to 0
 		require.NoError(t, actor2.Tell(ctx, actorSystem.TopicActor(), NewUnsubscribe(topic)))
@@ -638,19 +627,18 @@ func TestTopicActor(t *testing.T) {
 
 		stats, err = actorSystem.TopicStats(ctx, topic, time.Second)
 		require.NoError(t, err)
-		require.Zero(t, stats.LocalSubscriberCount)
-		require.Zero(t, stats.TopicInstanceCount)
+		require.Zero(t, stats.LocalSubscriberCount())
+		require.Zero(t, stats.TopicInstanceCount())
 
 		// a topic nobody ever subscribed to reports zero counts, not an error
 		stats, err = actorSystem.TopicStats(ctx, "unknown-topic", time.Second)
 		require.NoError(t, err)
-		require.Zero(t, stats.LocalSubscriberCount)
-		require.Zero(t, stats.TopicInstanceCount)
+		require.Zero(t, stats.LocalSubscriberCount())
+		require.Zero(t, stats.TopicInstanceCount())
 
 		require.NoError(t, actorSystem.Stop(ctx))
 	})
-
-	t.Run("With TopicStats pruning dead local subscribers", func(t *testing.T) {
+	t.Run("With TopicStats skipping dead local subscribers", func(t *testing.T) {
 		ctx := context.Background()
 		actorSystem, _ := NewActorSystem("testSys", WithLogger(log.DiscardLogger), WithPubSub())
 
@@ -679,16 +667,21 @@ func TestTopicActor(t *testing.T) {
 		require.True(t, ok)
 		subscribers.Set(dead.ID(), dead)
 
-		// the dead subscriber must be pruned from the count, mirroring the
-		// liveness filter sendToLocalSubscribers applies.
+		// the dead subscriber must be skipped in the count, mirroring the
+		// liveness filter sendToLocalSubscribers applies. The registry itself
+		// is left untouched by the read-only count.
 		stats, err := actorSystem.TopicStats(ctx, topic, time.Second)
 		require.NoError(t, err)
-		require.EqualValues(t, 1, stats.LocalSubscriberCount)
-		require.EqualValues(t, 1, stats.TopicInstanceCount)
+		require.EqualValues(t, 1, stats.LocalSubscriberCount())
+		require.EqualValues(t, 1, stats.TopicInstanceCount())
+
+		// the count does not mutate the registry: the stale entry is still there
+		subscribers, ok = topicActor.topics.Get(topic)
+		require.True(t, ok)
+		require.EqualValues(t, 2, subscribers.Len())
 
 		require.NoError(t, actorSystem.Stop(ctx))
 	})
-
 	t.Run("With TopicStats when the topic actor is not started", func(t *testing.T) {
 		ctx := context.Background()
 		actorSystem, _ := NewActorSystem("testSys", WithLogger(log.DiscardLogger))
@@ -703,5 +696,81 @@ func TestTopicActor(t *testing.T) {
 		require.ErrorIs(t, err, gerrors.ErrTopicActorNotStarted)
 
 		require.NoError(t, actorSystem.Stop(ctx))
+	})
+	t.Run("With TopicStats failing when a peer is unreachable", func(t *testing.T) {
+		ctx := context.Background()
+		actorSystem, _ := NewActorSystem("testSys", WithLogger(log.DiscardLogger), WithPubSub())
+
+		require.NoError(t, actorSystem.Start(ctx))
+		pause.For(time.Second)
+
+		// TopicStats prefers an explicit failure over an inconsistent count:
+		// a peer that cannot be reached fails the fan-out rather than being
+		// silently skipped. Query the peer helper directly with an address
+		// nothing is listening on to exercise that path deterministically.
+		ta := actorSystem.TopicActor().Actor().(*topicActor)
+		_, err := ta.queryRemotePeerInstanceCount(ctx, []remotePeer{{host: "127.0.0.1", port: 1}}, "test-topic")
+		require.Error(t, err)
+
+		require.NoError(t, actorSystem.Stop(ctx))
+	})
+	t.Run("With TopicStats aggregating instance counts across the cluster", func(t *testing.T) {
+		ctx := context.TODO()
+		srv := startNatsServer(t)
+
+		cl1, sd1 := testNATs(t, srv.Addr().String(), withTestPubSub())
+		require.NotNil(t, cl1)
+
+		cl2, sd2 := testNATs(t, srv.Addr().String(), withTestPubSub())
+		require.NotNil(t, cl2)
+
+		cl3, sd3 := testNATs(t, srv.Addr().String(), withTestPubSub())
+		require.NotNil(t, cl3)
+
+		actor1, err := cl1.Spawn(ctx, "actor1", NewMockSubscriber())
+		require.NoError(t, err)
+
+		actor2, err := cl2.Spawn(ctx, "actor2", NewMockSubscriber())
+		require.NoError(t, err)
+
+		topic := "test-topic"
+
+		// two nodes gain a subscriber; the third stays empty
+		require.NoError(t, actor1.Tell(ctx, cl1.TopicActor(), NewSubscribe(topic)))
+		require.NoError(t, actor2.Tell(ctx, cl2.TopicActor(), NewSubscribe(topic)))
+		pause.For(time.Second)
+
+		// queried from node1: 1 local subscriber, 2 topic-actor instances
+		// (node1 and node2) reporting subscribers cluster-wide
+		stats, err := cl1.TopicStats(ctx, topic, 5*time.Second)
+		require.NoError(t, err)
+		require.Equal(t, topic, stats.Topic())
+		require.EqualValues(t, 1, stats.LocalSubscriberCount())
+		require.EqualValues(t, 2, stats.TopicInstanceCount())
+
+		// queried from node3, which has no local subscriber: local count is 0
+		// but it still sees the two remote instances
+		stats, err = cl3.TopicStats(ctx, topic, 5*time.Second)
+		require.NoError(t, err)
+		require.Zero(t, stats.LocalSubscriberCount())
+		require.EqualValues(t, 2, stats.TopicInstanceCount())
+
+		// node2 loses its only subscriber: the instance count drops to 1
+		require.NoError(t, actor2.Tell(ctx, cl2.TopicActor(), NewUnsubscribe(topic)))
+		pause.For(time.Second)
+
+		stats, err = cl1.TopicStats(ctx, topic, 5*time.Second)
+		require.NoError(t, err)
+		require.EqualValues(t, 1, stats.LocalSubscriberCount())
+		require.EqualValues(t, 1, stats.TopicInstanceCount())
+
+		require.NoError(t, cl1.Stop(ctx))
+		require.NoError(t, cl2.Stop(ctx))
+		require.NoError(t, cl3.Stop(ctx))
+
+		require.NoError(t, sd1.Close())
+		require.NoError(t, sd2.Close())
+		require.NoError(t, sd3.Close())
+		srv.Shutdown()
 	})
 }

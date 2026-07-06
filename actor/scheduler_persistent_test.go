@@ -245,7 +245,7 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 
 		queue := newFakeJobQueue(sys)
 		locker := new(sync.Mutex)
-		sched := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
+		sched := newSchedulerWithQueue(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
 		sched.Start(context.TODO())
 
 		message := new(testpb.TestSend)
@@ -263,7 +263,7 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 
 		// Simulate a process restart: a brand-new scheduler bound to the same
 		// external queue must rebuild scheduledKeys and still deliver the job.
-		restarted := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
+		restarted := newSchedulerWithQueue(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
 		restarted.Start(context.TODO())
 		defer restarted.Stop(context.TODO())
 
@@ -279,7 +279,7 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 
 		queue := newFakeJobQueue(sys)
 		locker := new(sync.Mutex)
-		sched := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
+		sched := newSchedulerWithQueue(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
 		sched.Start(context.TODO())
 
 		message := new(testpb.TestSend)
@@ -289,7 +289,7 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 
 		sched.Stop(context.TODO())
 
-		restarted := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
+		restarted := newSchedulerWithQueue(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
 		restarted.Start(context.TODO())
 		defer restarted.Stop(context.TODO())
 
@@ -305,7 +305,7 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 
 		// the envelope only carries the target's name, so that is what Path reports
 		// for a rebuilt schedule.
-		assert.Equal(t, pid.Name(), byRef["intro-once"].Path)
+		assert.Equal(t, pid.Name(), byRef["intro-once"].Path.Name())
 	})
 
 	t.Run("cron envelopes outside cluster mode do not carry the single-fire flag", func(t *testing.T) {
@@ -313,7 +313,7 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 
 		queue := newFakeJobQueue(sys)
 		locker := new(sync.Mutex)
-		sched := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
+		sched := newSchedulerWithQueue(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
 		sched.Start(context.TODO())
 
 		message := new(testpb.TestSend)
@@ -338,7 +338,7 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 
 		queue := newFakeJobQueue(sys)
 		locker := new(sync.Mutex)
-		sched := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
+		sched := newSchedulerWithQueue(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
 		sched.Start(context.TODO())
 
 		message := new(testpb.TestSend)
@@ -346,7 +346,7 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 
 		sched.Stop(context.TODO())
 
-		restarted := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
+		restarted := newSchedulerWithQueue(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
 		restarted.Start(context.TODO())
 		defer restarted.Stop(context.TODO())
 
@@ -362,7 +362,7 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 
 		queue := newFakeJobQueue(sys)
 		locker := new(sync.Mutex)
-		sched := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
+		sched := newSchedulerWithQueue(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
 		sched.Start(context.TODO())
 
 		message := new(testpb.TestSend)
@@ -371,7 +371,7 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 
 		sched.Stop(context.TODO())
 
-		restarted := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
+		restarted := newSchedulerWithQueue(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, locker)
 		restarted.Start(context.TODO())
 		defer restarted.Stop(context.TODO())
 
@@ -386,7 +386,7 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 		sys, pid := newPersistentTestSystem(t, "persist-badmsg", "target")
 
 		queue := newFakeJobQueue(sys)
-		sched := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, new(sync.Mutex))
+		sched := newSchedulerWithQueue(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, new(sync.Mutex))
 		sched.Start(context.TODO())
 		defer sched.Stop(context.TODO())
 
@@ -398,7 +398,7 @@ func TestSchedulerPersistentJobQueue(t *testing.T) {
 		sys, pid := newPersistentTestSystem(t, "persist-badmsg-2", "target")
 
 		queue := newFakeJobQueue(sys)
-		sched := newScheduler(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, new(sync.Mutex))
+		sched := newSchedulerWithQueue(log.DiscardLogger, DefaultShutdownTimeout, sys, queue, new(sync.Mutex))
 		sched.Start(context.TODO())
 		defer sched.Stop(context.TODO())
 

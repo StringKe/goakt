@@ -77,12 +77,12 @@ func TestTopicStats(t *testing.T) {
 	// subscriber count (four).
 	require.Eventually(t, func() bool {
 		stats, err := node2.ActorSystem().TopicStats(ctx, topic, 5*time.Second)
-		return err == nil && stats.LocalSubscriberCount == 2 && stats.TopicInstanceCount == 3
+		return err == nil && stats.LocalSubscriberCount() == 2 && stats.TopicInstanceCount() == 3
 	}, 15*time.Second, 300*time.Millisecond)
 
 	stats1, err := node1.ActorSystem().TopicStats(ctx, topic, 5*time.Second)
 	require.NoError(t, err)
-	require.Equal(t, topic, stats1.Topic)
+	require.Equal(t, topic, stats1.Topic())
 	require.Equal(t, 1, stats1.LocalSubscriberCount)
 	require.Equal(t, 3, stats1.TopicInstanceCount)
 
@@ -97,7 +97,7 @@ func TestTopicStats(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		stats, err := node1.ActorSystem().TopicStats(ctx, topic, 5*time.Second)
-		return err == nil && stats.TopicInstanceCount == 2
+		return err == nil && stats.TopicInstanceCount() == 2
 	}, 15*time.Second, 300*time.Millisecond)
 
 	// node2 leaving the cluster degrades the aggregation gracefully: the
@@ -106,6 +106,6 @@ func TestTopicStats(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		stats, err := node1.ActorSystem().TopicStats(ctx, topic, 5*time.Second)
-		return err == nil && stats.TopicInstanceCount == 1 && stats.LocalSubscriberCount == 1
+		return err == nil && stats.TopicInstanceCount() == 1 && stats.LocalSubscriberCount() == 1
 	}, 20*time.Second, 300*time.Millisecond)
 }
