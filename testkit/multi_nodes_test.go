@@ -83,13 +83,13 @@ func TestTopicStats(t *testing.T) {
 	stats1, err := node1.ActorSystem().TopicStats(ctx, topic, 5*time.Second)
 	require.NoError(t, err)
 	require.Equal(t, topic, stats1.Topic())
-	require.Equal(t, 1, stats1.LocalSubscriberCount)
-	require.Equal(t, 3, stats1.TopicInstanceCount)
+	require.EqualValues(t, 1, stats1.LocalSubscriberCount())
+	require.EqualValues(t, 3, stats1.TopicInstanceCount())
 
 	stats3, err := node3.ActorSystem().TopicStats(ctx, topic, 5*time.Second)
 	require.NoError(t, err)
-	require.Equal(t, 1, stats3.LocalSubscriberCount)
-	require.Equal(t, 3, stats3.TopicInstanceCount)
+	require.EqualValues(t, 1, stats3.LocalSubscriberCount())
+	require.EqualValues(t, 3, stats3.TopicInstanceCount())
 
 	// unsubscribing node3's only subscriber drops the cluster-wide instance
 	// count, visible from a different node.

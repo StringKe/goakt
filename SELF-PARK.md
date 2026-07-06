@@ -1,6 +1,6 @@
 # self-park: full-capability GoAkt fork branch
 
-This branch is `github.com/StringKe/goakt` fork's long-lived integration branch: upstream GoAkt (`github.com/Tochemey/goakt`, currently v4.2.13+) plus twelve capabilities this team needs for single-app / multi-replica deployments. Everything here is implemented additively (new options, new packages, zero changed upstream signatures, zero new dependencies) and is intended to be offered upstream; until merged there, self-park is the source of truth.
+This branch is `github.com/StringKe/goakt` fork's long-lived integration branch: upstream GoAkt (`github.com/Tochemey/goakt`, currently v4.2.13+ with four of our capabilities merged upstream: cluster single-fire cron, schedule introspection, LeaderChanged, TopicStats) plus the remaining eight fork capabilities this team needs for single-app / multi-replica deployments. Everything here is implemented additively (new options, new packages, zero changed upstream signatures, zero new dependencies) and is intended to be offered upstream; until merged there, self-park is the source of truth.
 
 Upstream sync policy: `upstream/main` is merged in (never rebased). Feature branches `feat/01`..`feat/12` hold the upstream-clean cut of each capability for future PRs; note that post-integration fixes live on self-park only until cherry-picked back.
 
@@ -29,7 +29,7 @@ The module path is unchanged (`github.com/tochemey/goakt/v4`), so consumption go
 
 ```bash
 go mod edit -require=github.com/tochemey/goakt/v4@v4.2.13
-go mod edit -replace=github.com/tochemey/goakt/v4=github.com/StringKe/goakt/v4@v4.3.0-sp.5
+go mod edit -replace=github.com/tochemey/goakt/v4=github.com/StringKe/goakt/v4@v4.3.0-sp.6
 go mod tidy
 ```
 
