@@ -1,6 +1,6 @@
 # self-park: full-capability GoAkt fork branch
 
-This branch is `github.com/StringKe/goakt` fork's long-lived integration branch: upstream GoAkt (`github.com/Tochemey/goakt`, currently v4.2.13+ with four of our capabilities merged upstream: cluster single-fire cron, schedule introspection, LeaderChanged, TopicStats) plus the remaining eight fork capabilities this team needs for single-app / multi-replica deployments. Everything here is implemented additively (new options, new packages, zero changed upstream signatures, zero new dependencies) and is intended to be offered upstream; until merged there, self-park is the source of truth.
+This branch is `github.com/StringKe/goakt` fork's long-lived integration branch: upstream GoAkt (`github.com/Tochemey/goakt`, v4.3.0, which ships four capabilities we contributed: cluster single-fire cron, schedule introspection, LeaderChanged, TopicStats) plus the remaining eight fork capabilities this team needs for single-app / multi-replica deployments. Everything here is implemented additively (new options, new packages, zero changed upstream signatures, zero new dependencies) and is intended to be offered upstream; until merged there, self-park is the source of truth.
 
 Upstream sync policy: `upstream/main` is merged in (never rebased). Feature branches `feat/01`..`feat/12` hold the upstream-clean cut of each capability for future PRs; note that post-integration fixes live on self-park only until cherry-picked back.
 
@@ -28,12 +28,12 @@ Runnable samples: `playground/jobs-demo/`, `playground/gateway-echo/`.
 The module path is unchanged (`github.com/tochemey/goakt/v4`), so consumption goes through a `replace` directive in the application's go.mod (applies to main modules, which is exactly the app-side use case):
 
 ```bash
-go mod edit -require=github.com/tochemey/goakt/v4@v4.2.13
-go mod edit -replace=github.com/tochemey/goakt/v4=github.com/StringKe/goakt/v4@v4.3.0-sp.6
+go mod edit -require=github.com/tochemey/goakt/v4@v4.3.0
+go mod edit -replace=github.com/tochemey/goakt/v4=github.com/StringKe/goakt/v4@v4.3.1-sp.1
 go mod tidy
 ```
 
-Version convention: tags `v4.3.0-sp.N` on this fork mark verified snapshots of self-park (upstream base + all capabilities, full lint + race suite green). Prefer a tag over `@self-park` so builds stay reproducible; bump to the next `-sp.N` after each verified integration round. If the fork is private to your org, also set `GOPRIVATE=github.com/StringKe/*`.
+Version convention: tags `v4.3.1-sp.N` (upstream v4.3.0 base; earlier snapshots were `v4.3.0-sp.N`) on this fork mark verified snapshots of self-park (upstream base + all capabilities, full lint + race suite green). Prefer a tag over `@self-park` so builds stay reproducible; bump to the next `-sp.N` after each verified integration round. If the fork is private to your org, also set `GOPRIVATE=github.com/StringKe/*`.
 
 ## Where to find context (humans and AI assistants)
 
