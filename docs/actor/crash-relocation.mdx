@@ -4,9 +4,9 @@ description: Opt-in placement journal that relocates actors and grains after a n
 sidebarTitle: "Crash Relocation"
 ---
 
-[Relocation](/actor/relocation) migrates actors and grains from a node that **shuts down gracefully**. A node that crashes — `kill -9`, an OOM kill, hardware loss — never runs `preShutdown`, so no peer state is ever replicated to the rest of the cluster, and its relocatable actors and grains are simply gone until an external caller happens to re-activate them.
+[Relocation](/actor/relocation) migrates actors and grains from a node that **shuts down gracefully**. A node that crashes — `kill -9`, an OOM kill, hardware loss — never runs `preShutdown`, so no peer state is ever replicated to the rest of the cluster. GoAkt still recovers such a node by default, by [deriving its relocation set from the replicated cluster registry](/actor/relocation#crash-recovery), but that path needs the registry replicated (replica count above 1) and waits for olric's post-departure partition repair to go quiet before it scans.
 
-The **placement journal** closes that gap. It is opt-in and off by default: without it, GoAkt's behavior after a crash is unchanged from today.
+The **placement journal** is an opt-in, faster alternative: it replays exactly what this node placed, needs no quiescence wait, and works even with a replica count of 1. It is off by default: without it, GoAkt falls straight through to the registry-derived fallback after a crash.
 
 <Note>
 Crash relocation only helps actors and grains that opted into relocation in the first place (the default). Actors spawned with `WithRelocationDisabled` and grains spawned with `WithGrainDisableRelocation` are never journaled or replayed, on a crash or otherwise.
@@ -16,7 +16,7 @@ Crash relocation only helps actors and grains that opted into relocation in the 
 
 1. **Recording** — Every time a relocatable actor is spawned, or a relocatable grain is activated, GoAkt writes a placement entry describing it (address, kind, dependencies, supervisor, etc.) to the configured journal. The entry is removed when the actor or grain stops deliberately (passivation, `Kill`, `Shutdown`).
 2. **Detecting** — The cluster membership layer detects a node's departure and emits a `NodeLeft` event, exactly as it does for a graceful shutdown.
-3. **Replaying** — The cluster leader first looks for graceful peer state (pushed by `persistPeerStateToPeers`), as it always has. If none exists — the signature of a crash — and a placement journal is configured, the leader replays that node's remaining journal entries instead, reconstructing the same peer-state snapshot a graceful shutdown would have produced.
+3. **Replaying** — The cluster leader first looks for graceful peer state (pushed by `persistPeerStateToPeers`), as it always has. If none exists — the signature of a crash — and a placement journal is configured, the leader replays that node's remaining journal entries instead, reconstructing the same peer-state snapshot a graceful shutdown would have produced. This runs synchronously in the `NodeLeft` handler; only when the journal is not configured, or has nothing for that node, does the leader fall back to the [registry-derived recovery](/actor/relocation#crash-recovery).
 4. **Relocating** — From there, the existing relocation machinery takes over unchanged: singletons go to the leader, other actors and grains are distributed across the leader and peers. See [Relocation](/actor/relocation) for that flow.
 5. **Cleanup** — Once the leader's relocator finishes (successfully or not), the departed node's journal entries are cleared so the journal does not grow across repeated crashes.
 

@@ -25,7 +25,6 @@ package actor
 import (
 	"context"
 
-	"github.com/tochemey/goakt/v4/internal/internalpb"
 	"github.com/tochemey/goakt/v4/log"
 )
 
@@ -54,12 +53,9 @@ func (x *systemGuardian) PreStart(*Context) error {
 
 // Receive handle message
 func (x *systemGuardian) Receive(ctx *ReceiveContext) {
-	switch msg := ctx.Message().(type) {
+	switch ctx.Message().(type) {
 	case *PostStart:
 		x.handlePostStart(ctx)
-	case *internalpb.RebalanceComplete:
-		// TODO: TBD with the error
-		_ = x.completeRebalancing(msg)
 	case *Terminated:
 		// pass
 	case *PanicSignal:
@@ -99,45 +95,4 @@ func (x *systemGuardian) handlePanicSignal(ctx *ReceiveContext) {
 		// blindly shutdown the actor system. No need to check any error
 		_ = x.system.Stop(context.WithoutCancel(ctx.Context()))
 	}
-}
-
-// completeRebalancing wraps up the rebalancing of left node in the cluster
-func (x *systemGuardian) completeRebalancing(msg *internalpb.RebalanceComplete) error {
-	if x.logger.Enabled(log.InfoLevel) {
-		x.logger.Info("completing rebalancing...")
-	}
-	x.pid.ActorSystem().completeRelocation()
-
-	if x.logger.Enabled(log.DebugLevel) {
-		x.logger.Debugf("removing left node=%s from cluster store", msg.GetPeerAddress())
-	}
-
-	ctx := context.Background()
-	clusterStore := x.pid.ActorSystem().getClusterStore()
-	if err := clusterStore.DeletePeerState(ctx, msg.GetPeerAddress()); err != nil {
-		if x.logger.Enabled(log.ErrorLevel) {
-			x.logger.Errorf("failed to remove left node=%s from cluster store: %v (hint: check cluster store permissions)", msg.GetPeerAddress(), err)
-		}
-		return err
-	}
-
-	if x.logger.Enabled(log.DebugLevel) {
-		x.logger.Debugf("left node=%s removed from cache", msg.GetPeerAddress())
-	}
-
-	// the departed node's placements have now been replayed (or were never
-	// journaled, in which case this is a no-op); drop its journal entries so
-	// a placement journal does not keep growing across crashes.
-	if journal := x.pid.ActorSystem().getPlacementJournal(); journal != nil {
-		if err := journal.DeleteByNode(ctx, msg.GetPeerAddress()); err != nil {
-			if x.logger.Enabled(log.ErrorLevel) {
-				x.logger.Errorf("failed to remove left node=%s from placement journal: %v (hint: check placement journal store)", msg.GetPeerAddress(), err)
-			}
-		}
-	}
-
-	if x.logger.Enabled(log.InfoLevel) {
-		x.logger.Info("rebalancing completed successfully")
-	}
-	return nil
 }

@@ -28,9 +28,7 @@ import (
 	"testing"
 	"time"
 
-	goset "github.com/deckarep/golang-set/v2"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
@@ -576,33 +574,10 @@ func TestCrashRelocationReplayWithUnregisteredActorType(t *testing.T) {
 	srv.Shutdown()
 }
 
-// TestCrashRelocationDefaultBehaviorUnaffected proves that without a
-// configured placement journal, an unexpected NodeLeft with no graceful
-// cluster-store state behaves exactly as it does today: nothing is
-// relocated.
-func TestCrashRelocationDefaultBehaviorUnaffected(t *testing.T) {
-	clusterMock := mockcluster.NewCluster(t)
-	clusterMock.EXPECT().IsLeader(mock.Anything).Return(true)
-
-	sys := MockReplicationTestSystem(clusterMock)
-	sys.clusterStore = &recordingPeerStateStore{}
-	sys.relocationEnabled.Store(true)
-	sys.rebalancedNodes = goset.NewSet[string]()
-	sys.rebalancingQueue = make(chan *internalpb.PeerState, 1)
-	sys.remoteWatches = newRemoteWatchRegistry()
-
-	deadNodeAddr := "127.0.0.1:29999"
-	event := &cluster.Event{
-		Type:    cluster.NodeLeft,
-		Payload: &cluster.NodeLeftEvent{Address: deadNodeAddr, Timestamp: time.Now()},
-	}
-	sys.handleNodeLeftEvent(event)
-
-	select {
-	case peerState := <-sys.rebalancingQueue:
-		t.Fatalf("expected no peer state to be enqueued, got %v", peerState)
-	default:
-		// expected: no placement journal configured, no graceful state
-		// available, so nothing is enqueued for relocation
-	}
-}
+// Without a configured journal, resolveCrashedNodeState finds nothing for a
+// crashed node (no graceful cluster-store state either); the "no journal"
+// subtest of TestResolveCrashedNodeState covers that directly. The
+// NodeLeft handler then falls through to the registry-derived crash recovery
+// (deriveRelocationSetFromRegistry, exercised directly in
+// actor_system_test.go), so there is no "nothing happens" default left to
+// assert here now that crash recovery is on by default.
