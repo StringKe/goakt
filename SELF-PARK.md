@@ -1,50 +1,60 @@
-# self-park: full-capability GoAkt fork branch
+# self-park: minimal core patches on top of upstream GoAkt
 
-This branch is `github.com/StringKe/goakt` fork's long-lived integration branch: upstream GoAkt (`github.com/Tochemey/goakt`, v4.3.1, which ships five contributions of ours: cluster single-fire cron, schedule introspection, LeaderChanged, TopicStats) plus the remaining eight fork capabilities this team needs for single-app / multi-replica deployments. Everything here is implemented additively (new options, new packages, zero changed upstream signatures, zero new dependencies) and is intended to be offered upstream; until merged there, self-park is the source of truth.
+This branch is `github.com/StringKe/goakt` fork's long-lived integration branch. It tracks upstream GoAkt (`github.com/Tochemey/goakt`, v4.3.1) and carries **only the capabilities that cannot be built outside the actor core**. Everything else has moved out: six contributions were merged upstream, and the runtime-shaped subsystems now live in standalone satellite libraries built on upstream's public API.
 
-Upstream sync policy: `upstream/main` is merged in (never rebased). Feature branches `feat/01`..`feat/12` hold the upstream-clean cut of each capability for future PRs; note that post-integration fixes live on self-park only until cherry-picked back.
+Upstream sync policy: `upstream/main` is merged in (never rebased).
 
-## Capability index
+## What is left in this fork (2 core patches)
 
-| Capability | Entry point | Docs |
+| Capability | Entry point | Why it cannot live outside core |
 | --- | --- | --- |
-| Persistent scheduler queue (schedules survive restarts) | `actor.WithSchedulerJobQueue(queue, locker)` | docs/actor/scheduling.mdx ("Persistent Scheduling") |
-| Cluster single-fire cron (one node fires per tick) | **upstream-native** since #1242: intrinsic in cluster mode, explicit `WithReference` required | docs/actor/scheduling.mdx |
-| Scheduler introspection | **upstream-native** since #1241: `ActorSystem.ListSchedules()` -> `ScheduleInfo{Reference, Path}` | docs/actor/scheduling.mdx |
-| Cluster KV + distributed lock | `ActorSystem.KV()` -> `kv.Store` (Get/Put/PutIfAbsent/TTL/TryLock) | docs/clustering/kv-store.mdx |
-| Leader status + change events | **upstream-native** since #1239: `ActorSystem.IsLeader(ctx)`/`Leader(ctx)`, `LeaderChanged` eventstream event | docs/clustering/clustered.mdx |
-| Cluster-wide rate limiting | `ratelimit.New(store, limit, window)` | docs/clustering/rate-limiting.mdx |
-| Crash relocation | upstream now recovers crashed nodes by default (registry-derived, since #1256); our `actor.WithPlacementJournal(store)` remains an opt-in faster path: synchronous replay, no quiescence wait, and it works at replicaCount=1 where registry derivation has nothing to derive from | docs/actor/crash-relocation.mdx |
-| Non-actor pub/sub subscriptions | `ActorSystem.SubscribeTopic(topic, handler)` | docs/advanced/pubsub-bridge.mdx |
-| Topic statistics | **upstream-native** since #1246: `ActorSystem.TopicStats(ctx, topic, timeout)` -> local subscriber count + cluster instance count | docs/advanced/pubsub.mdx ("Topic statistics") |
-| Ephemeral high-churn actors | pattern: `WithRelocationDisabled()` + `WithPassivationStrategy(passivation.NewLongLivedStrategy())` (upstream already had both; our sugar option was removed after upstream review) | docs/actor/ephemeral-actors.mdx |
-| Durable jobs: at-least-once, retry/DLQ, fan-out/fan-in, inspector | package `jobs` (`jobs.NewEngine`) | docs/advanced/jobs.mdx |
-| Gateway: cluster-shared TLS (Cloudflare Origin CA), WS/SSE connection registry, two-tier delivery, shutdown draining | package `gateway` (`gateway.NewServer`, `gateway.NewRegistry`) | docs/advanced/gateway.mdx |
+| Persistent scheduler queue (schedules survive restarts) | `actor.WithSchedulerJobQueue(queue, locker)` | It replaces the scheduler's internal go-quartz job queue and persists a delivery-intent envelope. No public API reaches that far. |
+| Placement journal (crash relocation at `replicaCount=1`) | `actor.WithPlacementJournal(store)` | The record hook must sit on the spawn path and the delete hooks on relocation's finalization points. Nothing outside core can inject them. Proposed upstream in [discussion #1259](https://github.com/Tochemey/goakt/discussions/1259). |
 
-Runnable samples: `playground/jobs-demo/`, `playground/gateway-echo/`.
+Both are additive: unconfigured, behavior is byte-for-byte upstream.
 
-## Consuming this branch from another Go project
+## Satellite libraries (built on upstream GoAkt, no fork dependency)
 
-The module path is unchanged (`github.com/tochemey/goakt/v4`), so consumption goes through a `replace` directive in the application's go.mod (applies to main modules, which is exactly the app-side use case):
+| Library | What it does |
+| --- | --- |
+| [goakt-gateway](https://github.com/StringKe/goakt-gateway) | Cluster-aware ingress: WebSocket/SSE connection registry with two-tier delivery (local socket write on a hit, cluster routing only cross-node), plus cluster-shared TLS termination (pluggable issuers incl. Cloudflare Origin CA, optional Authenticated Origin Pulls). Coordination (issuance lock, certificate distribution) runs on a `Coordinator` interface with in-memory and Redis implementations. |
+| [goakt-jobs](https://github.com/StringKe/goakt-jobs) | Durable at-least-once task execution: lease-based delivery with fencing tokens, retry with backoff, dead-lettering, an inspector API, and cluster fan-out/fan-in. Jobs are delivered as ordinary actor messages. |
+
+Both depend on `github.com/tochemey/goakt/v4` only - no fork, no internal packages, no `replace` directive - so they work for any GoAkt user.
+
+## Merged upstream (no longer fork-only)
+
+Cluster single-fire cron (#1242), scheduler introspection (#1241), `LeaderChanged` event (#1239), `TopicStats` (design we drove, #1246), remoting start-context fix (#1253), cluster bootstrap retry (#1258).
+
+## Deliberately not implemented
+
+**Cluster KV and distributed lock.** The embedded Olric store is PA/EC with last-write-wins and no consensus; its own README states its lock is "recommended for efficiency, not correctness". Building a certificate-issuance lock or a rate limiter on it publishes a guarantee the substrate cannot honor. Use Redis (`SET NX PX` plus a compare-and-delete release) for anything that needs real mutual exclusion - that is what goakt-gateway does.
+
+**Cluster-wide rate limiting.** Same reason: an eventually-consistent counter admits the full budget on each side of a partition. Use Redis.
+
+**Non-actor pub/sub subscription bridge.** Upstream declined it, and it turned out to be unnecessary: a satellite can spawn its own bridge actor and subscribe with the public `actor.Subscribe` message to `ActorSystem.TopicActor()`, which is exactly what goakt-gateway does.
+
+## Consuming this branch
+
+The module path is unchanged (`github.com/tochemey/goakt/v4`), so consumption goes through a `replace` directive in the application's go.mod:
 
 ```bash
 go mod edit -require=github.com/tochemey/goakt/v4@v4.3.1
-go mod edit -replace=github.com/tochemey/goakt/v4=github.com/StringKe/goakt/v4@v4.3.1-sp.5
+go mod edit -replace=github.com/tochemey/goakt/v4=github.com/StringKe/goakt/v4@v4.3.1-sp.6
 go mod tidy
 ```
 
-Version convention: tags `v4.3.1-sp.N` (upstream v4.3.0 base; earlier snapshots were `v4.3.0-sp.N`) on this fork mark verified snapshots of self-park (upstream base + all capabilities, full lint + race suite green). Prefer a tag over `@self-park` so builds stay reproducible; bump to the next `-sp.N` after each verified integration round. If the fork is private to your org, also set `GOPRIVATE=github.com/StringKe/*`.
+Tags `v4.3.1-sp.N` mark verified snapshots (upstream base plus the core patches above, full lint and race suite green). Prefer a tag over `@self-park` so builds stay reproducible.
 
-## Where to find context (humans and AI assistants)
+Applications that also use the satellites just add them normally - they resolve against upstream GoAkt, and the `replace` above transparently points that at this fork.
 
-1. This file - capability inventory and entry points.
-2. `docs/*.mdx` pages listed above - semantics, guarantees, and worked examples per capability (Mintlify sources; readable as plain markdown, or `mint dev` to browse).
-3. Package godoc - every exported type/option documents its contract; start at `go doc github.com/tochemey/goakt/v4/jobs` and `go doc github.com/tochemey/goakt/v4/gateway`.
-4. `playground/jobs-demo` and `playground/gateway-echo` - minimal, runnable end-to-end wiring.
-5. Tests as specification: `actor/scheduler_persistent_test.go`, `jobs/*_test.go`, `gateway/*_test.go`, and the `testkit/*_test.go` multi-node suites pin the exact cluster semantics (single-fire, lease takeover, single issuance, presence).
+## Where to find context
 
-## Known limitations (current round)
+1. This file - what is here and what deliberately is not.
+2. `docs/actor/scheduling.mdx` ("Persistent Scheduling") and `docs/actor/crash-relocation.mdx` - the two remaining capabilities.
+3. Satellite READMEs for everything that moved out.
 
-- `jobs`: delivery targets actors only (grain delivery is a planned follow-up); the lease fencing token is enforced by the in-memory store but not yet part of the persisted job envelope proto.
-- `gateway`: ACME issuance is an interface slot only (static files and Cloudflare Origin CA are implemented); `Inspector.Retry` currently allows retry from any state.
-- Cluster single-fire is cron-only (interval/one-shot schedules stay node-local); claim entries are reclaimed by TTL alone, and a node reaching a tick later than the claim TTL skips it (upstream semantics).
+## Known limitations
+
+- Placement journal: the record hook journals relocatable actors and eager grains; lazy grain directory entries follow upstream's own relocation semantics.
+- Persistent scheduler queue: the journal envelope carries the delivery intent, so a rebuilt schedule resolves its target by name at fire time (the actor need not be the same process instance).

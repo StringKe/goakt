@@ -137,17 +137,6 @@ func TestNotRunningReturnsErrEngineNotRunning(t *testing.T) {
 	require.ErrorIs(t, err, ErrEngineNotRunning)
 	require.Equal(t, -1, next)
 
-	require.ErrorIs(t, cluster.PutKV(ctx, "key", []byte("value"), 0), ErrEngineNotRunning)
-	require.ErrorIs(t, cluster.PutKVIfAbsent(ctx, "key", []byte("value"), 0), ErrEngineNotRunning)
-
-	_, err = cluster.GetKV(ctx, "key")
-	require.ErrorIs(t, err, ErrEngineNotRunning)
-
-	require.ErrorIs(t, cluster.DeleteKV(ctx, "key"), ErrEngineNotRunning)
-
-	_, err = cluster.TryLock(ctx, "key", time.Second)
-	require.ErrorIs(t, err, ErrEngineNotRunning)
-
 	require.NoError(t, cluster.Stop(ctx))
 
 	provider.AssertExpectations(t)

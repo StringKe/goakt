@@ -296,18 +296,6 @@ func (x *MockCluster) NextRoundRobinValue(context.Context, string) (int, error) 
 	panic("unexpected call")
 }
 
-func (x *MockCluster) PutKV(context.Context, string, []byte, time.Duration) error {
-	panic("unexpected call")
-}
-func (x *MockCluster) PutKVIfAbsent(context.Context, string, []byte, time.Duration) error {
-	panic("unexpected call")
-}
-func (x *MockCluster) GetKV(context.Context, string) ([]byte, error) { panic("unexpected call") }
-func (x *MockCluster) DeleteKV(context.Context, string) error        { panic("unexpected call") }
-func (x *MockCluster) TryLock(context.Context, string, time.Duration) (Lock, error) {
-	panic("unexpected call")
-}
-
 func newEventTestCluster(host string, port int) *cluster {
 	return &cluster{
 		node:                    &discovery.Node{Host: host, PeersPort: port},

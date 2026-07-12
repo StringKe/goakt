@@ -3,24 +3,55 @@
   "name": "GoAkt",
   "description": "Distributed actor framework for Go, inspired by Erlang and Akka. Build reactive and distributed systems with typed actor messages.",
   "theme": "linden",
-  "seo": { "metatags": { "canonical": "https://docs.goakt.dev" } },
-  "colors": { "primary": "#2563EB", "light": "#3B82F6", "dark": "#1D4ED8" },
+  "seo": {
+    "metatags": {
+      "canonical": "https://docs.goakt.dev"
+    }
+  },
+  "colors": {
+    "primary": "#2563EB",
+    "light": "#3B82F6",
+    "dark": "#1D4ED8"
+  },
   "favicon": "/assets/goakt-icon.png",
-  "background": { "decoration": "gradient" },
-  "fonts": { "heading": { "family": "Geist Mono" }, "body": { "family": "Geist Mono" } },
-  "appearance": { "default": "system" },
+  "background": {
+    "decoration": "gradient"
+  },
+  "fonts": {
+    "heading": {
+      "family": "Geist Mono"
+    },
+    "body": {
+      "family": "Geist Mono"
+    }
+  },
+  "appearance": {
+    "default": "system"
+  },
   "navbar": {
     "links": [
       {
         "label": "Reference",
         "href": "https://pkg.go.dev/github.com/tochemey/goakt/v4"
       },
-      { "label": "GitHub", "href": "https://github.com/tochemey/goakt" }
+      {
+        "label": "GitHub",
+        "href": "https://github.com/tochemey/goakt"
+      }
     ]
   },
-  "footer": { "socials": { "github": "https://github.com/tochemey/goakt" } },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/tochemey/goakt"
+    }
+  },
   "styling": {
-    "codeblocks": { "theme": { "light": "github-light", "dark": "dracula" } }
+    "codeblocks": {
+      "theme": {
+        "light": "github-light",
+        "dark": "dracula"
+      }
+    }
   },
   "navigation": {
     "groups": [
@@ -62,7 +93,9 @@
       },
       {
         "group": "Grains",
-        "pages": ["/grains/overview"],
+        "pages": [
+          "/grains/overview"
+        ],
         "icon": "box"
       },
       {
@@ -79,9 +112,7 @@
           "/clustering/standalone",
           "/clustering/clustered",
           "/clustering/multi-datacenter",
-          "/clustering/service-discovery",
-          "/clustering/kv-store",
-          "/clustering/rate-limiting"
+          "/clustering/service-discovery"
         ],
         "icon": "network"
       },
@@ -99,12 +130,9 @@
           "/advanced/client",
           "/advanced/extensions-and-dependencies",
           "/advanced/pubsub",
-          "/advanced/pubsub-bridge",
           "/advanced/distributed-data",
           "/advanced/streams",
-          "/advanced/coordinated-shutdown",
-          "/advanced/jobs",
-          "/advanced/gateway"
+          "/advanced/coordinated-shutdown"
         ],
         "icon": "zap"
       },
@@ -139,10 +167,14 @@
       },
       {
         "group": "Meta Framework",
-        "pages": ["/meta-framework/ego"],
+        "pages": [
+          "/meta-framework/ego"
+        ],
         "icon": "layers"
       }
     ]
   },
-  "icons": { "library": "lucide" }
+  "icons": {
+    "library": "lucide"
+  }
 }

@@ -84,8 +84,6 @@ const (
 	namespaceGrains recordNamespace = "grains"
 	namespaceKinds  recordNamespace = "kinds"
 	namespaceJobs   recordNamespace = "jobs"
-	namespaceKV     recordNamespace = "kv"
-	namespaceLocks  recordNamespace = "locks"
 	// namespaceScheduleFire stores the short-lived fire claims used to arbitrate which node
 	// delivers a given tick of a cluster-wide cron schedule (see actor.ScheduleWithCron).
 	namespaceScheduleFire recordNamespace = "schedule-fire"
@@ -181,32 +179,6 @@ type Cluster interface {
 	// The key here is either actors or grains. When the node that owns the key goes down,
 	// the sequence may be reset.
 	NextRoundRobinValue(ctx context.Context, key string) (int, error)
-	// PutKV stores a raw value in the cluster-scoped key/value registry under the given key,
-	// optionally applying a TTL after which the entry expires. A zero or negative ttl means
-	// the entry never expires.
-	PutKV(ctx context.Context, key string, value []byte, ttl time.Duration) error
-	// PutKVIfAbsent stores a raw value in the cluster-scoped key/value registry only if the
-	// key is not already present, optionally applying a TTL. It returns ErrKVKeyExists if the
-	// key is already present.
-	PutKVIfAbsent(ctx context.Context, key string, value []byte, ttl time.Duration) error
-	// GetKV retrieves the raw value stored under the given key in the cluster-scoped key/value
-	// registry. It returns ErrKVKeyNotFound if the key does not exist.
-	GetKV(ctx context.Context, key string) ([]byte, error)
-	// DeleteKV removes the value stored under the given key in the cluster-scoped key/value
-	// registry. It is a no-op if the key does not exist.
-	DeleteKV(ctx context.Context, key string) error
-	// TryLock attempts to acquire a distributed lock for the given key. The lock is
-	// automatically released after ttl elapses if Unlock is never called. TryLock does not
-	// block waiting for the lock to become available: it returns ErrLockNotAcquired immediately
-	// if the key is already locked by another holder.
-	TryLock(ctx context.Context, key string, ttl time.Duration) (Lock, error)
-}
-
-// Lock represents a distributed lock acquired through Cluster.TryLock.
-type Lock interface {
-	// Unlock releases the lock. It returns ErrLockNotHeld if the lock has already expired
-	// or been released.
-	Unlock(ctx context.Context) error
 }
 
 // cluster implements the Cluster interface backed by an Olric unified

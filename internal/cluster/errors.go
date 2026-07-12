@@ -43,15 +43,6 @@ var (
 	ErrGrainAlreadyExists = errors.New("grain already exists")
 	// ErrKindAlreadyExists is returned when an actor kind entry already exists.
 	ErrKindAlreadyExists = errors.New("kind already exists")
-	// ErrKVKeyNotFound is returned when a key is not present in the cluster key/value registry.
-	ErrKVKeyNotFound = errors.New("kv key not found")
-	// ErrKVKeyExists is returned by PutKVIfAbsent when the key is already present.
-	ErrKVKeyExists = errors.New("kv key already exists")
-	// ErrLockNotAcquired is returned when TryLock fails to acquire the lock before its deadline.
-	ErrLockNotAcquired = errors.New("lock not acquired")
-	// ErrLockNotHeld is returned when Unlock is called for a lock that is no longer held,
-	// for example because it already expired or was already released.
-	ErrLockNotHeld = errors.New("lock not held")
 	// ErrScheduleFireClaimed is returned by ClaimScheduleFire when another node has already
 	// won the race for the given key.
 	ErrScheduleFireClaimed = errors.New("schedule fire already claimed")
