@@ -1,6 +1,6 @@
 # self-park: full-capability GoAkt fork branch
 
-This branch is `github.com/StringKe/goakt` fork's long-lived integration branch: upstream GoAkt (`github.com/Tochemey/goakt`, v4.3.0, which ships four capabilities we contributed: cluster single-fire cron, schedule introspection, LeaderChanged, TopicStats) plus the remaining eight fork capabilities this team needs for single-app / multi-replica deployments. Everything here is implemented additively (new options, new packages, zero changed upstream signatures, zero new dependencies) and is intended to be offered upstream; until merged there, self-park is the source of truth.
+This branch is `github.com/StringKe/goakt` fork's long-lived integration branch: upstream GoAkt (`github.com/Tochemey/goakt`, v4.3.1, which ships five contributions of ours: cluster single-fire cron, schedule introspection, LeaderChanged, TopicStats) plus the remaining eight fork capabilities this team needs for single-app / multi-replica deployments. Everything here is implemented additively (new options, new packages, zero changed upstream signatures, zero new dependencies) and is intended to be offered upstream; until merged there, self-park is the source of truth.
 
 Upstream sync policy: `upstream/main` is merged in (never rebased). Feature branches `feat/01`..`feat/12` hold the upstream-clean cut of each capability for future PRs; note that post-integration fixes live on self-park only until cherry-picked back.
 
@@ -14,7 +14,7 @@ Upstream sync policy: `upstream/main` is merged in (never rebased). Feature bran
 | Cluster KV + distributed lock | `ActorSystem.KV()` -> `kv.Store` (Get/Put/PutIfAbsent/TTL/TryLock) | docs/clustering/kv-store.mdx |
 | Leader status + change events | **upstream-native** since #1239: `ActorSystem.IsLeader(ctx)`/`Leader(ctx)`, `LeaderChanged` eventstream event | docs/clustering/clustered.mdx |
 | Cluster-wide rate limiting | `ratelimit.New(store, limit, window)` | docs/clustering/rate-limiting.mdx |
-| Crash relocation (kill -9 recovery via placement journal) | `actor.WithPlacementJournal(store)` | docs/actor/crash-relocation.mdx |
+| Crash relocation | upstream now recovers crashed nodes by default (registry-derived, since #1256); our `actor.WithPlacementJournal(store)` remains an opt-in faster path: synchronous replay, no quiescence wait, and it works at replicaCount=1 where registry derivation has nothing to derive from | docs/actor/crash-relocation.mdx |
 | Non-actor pub/sub subscriptions | `ActorSystem.SubscribeTopic(topic, handler)` | docs/advanced/pubsub-bridge.mdx |
 | Topic statistics | **upstream-native** since #1246: `ActorSystem.TopicStats(ctx, topic, timeout)` -> local subscriber count + cluster instance count | docs/advanced/pubsub.mdx ("Topic statistics") |
 | Ephemeral high-churn actors | pattern: `WithRelocationDisabled()` + `WithPassivationStrategy(passivation.NewLongLivedStrategy())` (upstream already had both; our sugar option was removed after upstream review) | docs/actor/ephemeral-actors.mdx |
@@ -28,8 +28,8 @@ Runnable samples: `playground/jobs-demo/`, `playground/gateway-echo/`.
 The module path is unchanged (`github.com/tochemey/goakt/v4`), so consumption goes through a `replace` directive in the application's go.mod (applies to main modules, which is exactly the app-side use case):
 
 ```bash
-go mod edit -require=github.com/tochemey/goakt/v4@v4.3.0
-go mod edit -replace=github.com/tochemey/goakt/v4=github.com/StringKe/goakt/v4@v4.3.1-sp.4
+go mod edit -require=github.com/tochemey/goakt/v4@v4.3.1
+go mod edit -replace=github.com/tochemey/goakt/v4=github.com/StringKe/goakt/v4@v4.3.1-sp.5
 go mod tidy
 ```
 
